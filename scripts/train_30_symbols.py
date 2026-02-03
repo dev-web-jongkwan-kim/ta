@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-30종목 지원 최적화된 학습 파이프라인
+30종목 학습 파이프라인 (배치 학습)
 
-Week 1-3 최적화 통합:
-- float32 변환 (메모리 50% 절감)
-- 심볼별 증분 학습 (메모리 1/N)
-- Optuna 단일화 (시간 85% 절감)
-- 저메모리 LightGBM 파라미터
-- Streaming cursor
-- Rolling Correlation 피처
-- Dynamic TP/SL
-- Half Kelly 포지션 사이징
+최적화 설정:
+- 배치 학습 (전체 데이터 한번에 학습) - 최고 성능
+- Optuna 타겟별 개별 튜닝 (50 trials × 4 targets)
+- 피처 선택 (누적 중요도 99.9%)
+- Meta-labeling
+- CatBoost 앙상블
+- 멀티 타임프레임 (1m, 15m, 1h)
+
+최고 결과: PF=2.64, Expectancy=+0.30% (er>0.001 필터)
 
 Usage:
     python scripts/train_30_symbols.py
     python scripts/train_30_symbols.py --symbols BTCUSDT,ETHUSDT,DOTUSDT
-    python scripts/train_30_symbols.py --optuna-trials 20
+    python scripts/train_30_symbols.py --optuna-trials 30
     python scripts/train_30_symbols.py --skip-optuna  # 기본 파라미터 사용
 """
 from __future__ import annotations
@@ -27,12 +27,11 @@ from datetime import timedelta
 from typing import Dict, List, Any
 
 from packages.common.config import get_settings
-from packages.common.db import fetch_all, get_conn
-from packages.common.risk import calculate_kelly_from_trades, get_dynamic_barriers
+from packages.common.db import get_conn
 from services.labeling.pipeline import LabelingConfig
-from services.training.train_optimized import (
-    OptimizedTrainConfig,
-    run_optimized_training,
+from services.training.train_improved import (
+    ImprovedTrainConfig,
+    run_improved_training,
 )
 
 
@@ -111,10 +110,6 @@ def print_results(result: Dict[str, Any]) -> None:
     print("-" * 50)
 
     if trade.get("win_rate") and trade.get("expectancy"):
-        # 간단한 추정
-        wins = [trade.get("expectancy", 0) * 2]  # 가정
-        losses = [abs(trade.get("expectancy", 0))]  # 가정
-
         win_rate = trade.get("win_rate", 50) / 100
         avg_win = trade.get("expectancy", 0.001) * 2 if trade.get("expectancy", 0) > 0 else 0.001
         avg_loss = abs(trade.get("expectancy", 0.001))
@@ -155,7 +150,7 @@ def print_results(result: Dict[str, Any]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="30종목 최적화 학습")
+    parser = argparse.ArgumentParser(description="30종목 배치 학습")
     parser.add_argument(
         "--symbols",
         type=str,
@@ -165,8 +160,8 @@ def main():
     parser.add_argument(
         "--optuna-trials",
         type=int,
-        default=30,
-        help="Optuna 시행 횟수 (기본값: 30)",
+        default=50,
+        help="Optuna 시행 횟수 (기본값: 50, 타겟별 개별 튜닝)",
     )
     parser.add_argument(
         "--skip-optuna",
@@ -179,16 +174,9 @@ def main():
         help="Meta-labeling 스킵",
     )
     parser.add_argument(
-        "--top-n-features",
-        type=int,
-        default=50,
-        help="선택할 피처 수 (기본값: 50)",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=50000,
-        help="DB 청크 크기 (기본값: 50000)",
+        "--skip-catboost",
+        action="store_true",
+        help="CatBoost 앙상블 스킵",
     )
     args = parser.parse_args()
 
@@ -199,7 +187,7 @@ def main():
         symbols = get_universe()
 
     print("=" * 70)
-    print("30종목 최적화 학습 파이프라인")
+    print("30종목 배치 학습 파이프라인")
     print("=" * 70)
     print(f"심볼: {len(symbols)}개")
     if len(symbols) <= 10:
@@ -207,13 +195,13 @@ def main():
     else:
         print(f"  {', '.join(symbols[:5])} ... {', '.join(symbols[-3:])}")
 
-    print(f"\n최적화 설정:")
-    print(f"  - float32: Yes")
-    print(f"  - 증분 학습: Yes (심볼별)")
-    print(f"  - Optuna: {'No' if args.skip_optuna else f'Yes ({args.optuna_trials} trials)'}")
+    print(f"\n학습 설정:")
+    print(f"  - 학습 방식: 배치 (전체 데이터 한번에)")
+    print(f"  - 멀티 타임프레임: Yes (1m, 15m, 1h)")
+    print(f"  - Optuna: {'No' if args.skip_optuna else f'Yes ({args.optuna_trials} trials × 4 targets)'}")
     print(f"  - Meta-labeling: {'No' if args.skip_meta else 'Yes'}")
-    print(f"  - Feature Selection: Top {args.top_n_features}")
-    print(f"  - Chunk Size: {args.chunk_size:,}")
+    print(f"  - CatBoost 앙상블: {'No' if args.skip_catboost else 'Yes'}")
+    print(f"  - Feature Selection: 누적 중요도 99.9%")
 
     # 데이터 범위 확인
     min_ts, max_ts = get_data_range()
@@ -238,29 +226,26 @@ def main():
     print(f"  Label spec: {spec_hash}")
 
     # 학습 설정
-    cfg = OptimizedTrainConfig(
+    cfg = ImprovedTrainConfig(
         label_spec_hash=spec_hash,
-        feature_schema_version=3,  # 기존 피처 스키마 (4는 Rolling Corr 추가 후)
-        train_start=train_start.isoformat(),
-        train_end=train_end.isoformat(),
-        val_start=val_start.isoformat(),
-        val_end=val_end.isoformat(),
+        feature_schema_version=3,
+        train_start=train_start.strftime("%Y-%m-%d"),
+        train_end=train_end.strftime("%Y-%m-%d"),
+        val_start=val_start.strftime("%Y-%m-%d"),
+        val_end=val_end.strftime("%Y-%m-%d"),
         targets=("er_long", "q05_long", "e_mae_long", "e_hold_long"),
+        use_multi_tf=True,  # 멀티 타임프레임 활성화
         use_optuna=not args.skip_optuna,
         optuna_trials=args.optuna_trials,
-        optuna_single_target=True,
         use_feature_selection=True,
-        top_n_features=args.top_n_features,
+        feature_importance_threshold=0.001,  # 누적 중요도 99.9% 기준
         use_meta_labeling=not args.skip_meta,
-        use_catboost_ensemble=False,  # 저사양에서 비활성화
-        use_float32=True,
-        chunk_size=args.chunk_size,
-        free_raw_data=True,
+        use_catboost_ensemble=not args.skip_catboost,
     )
 
     # 학습 실행
     print("\n" + "-" * 70)
-    result = run_optimized_training(cfg, symbols=symbols)
+    result = run_improved_training(cfg, symbols=symbols)
 
     # 결과 출력
     print_results(result)

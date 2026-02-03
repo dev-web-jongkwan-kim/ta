@@ -303,7 +303,7 @@ for symbol in symbols:
 
 | 항목 | 현재 (3종목) | 개선 후 (30종목) |
 |------|-------------|-----------------|
-| 메모리 | 3-5 GB | **< 2 GB** |
+| 메모리 | 3-5 GB | **4-6 GB** |
 | 학습 시간 | 2시간 | **3-4시간** |
 | DB 쿼리 | 9회 | **30회** |
 
@@ -313,28 +313,66 @@ for symbol in symbols:
 
 ### Week 1: 필수 메모리/CPU 최적화
 
-- [ ] float32 변환
-- [ ] 심볼별 증분 학습 구현
-- [ ] Optuna 단일화
-- [ ] 저메모리 LightGBM 파라미터
+- [x] float32 변환
+- [x] ~~심볼별 증분 학습 구현~~ (배치 학습이 성능 우수, 폐기)
+- [x] Optuna 타겟별 개별 튜닝 (50 trials × 4 targets)
+- [x] 최적 LightGBM 파라미터 (num_leaves=64-256, n_estimators=500-1000)
 
 ### Week 2: I/O 및 추가 최적화
 
-- [ ] Streaming cursor 적용
-- [ ] Feature Selection 캐싱
-- [ ] 쿼리 통합
+- [x] Feature Selection (누적 중요도 99.9%)
+- [x] 멀티 타임프레임 (1m, 15m, 1h)
+- [x] CatBoost 앙상블
 
 ### Week 3: ML 개선
 
-- [ ] Rolling Correlation 피처
-- [ ] Dynamic TP/SL
-- [ ] Half Kelly 사이징
+- [x] Rolling Correlation 피처 (packages/common/risk.py)
+- [x] Dynamic TP/SL (packages/common/risk.py)
+- [x] Half Kelly 사이징 (packages/common/risk.py)
+- [x] Meta-labeling (2차 필터 모델)
 
 ### Week 4: 검증 및 배포
 
+- [x] 3종목 학습 테스트 완료
 - [ ] 30종목 학습 테스트
 - [ ] 실시간 추론 성능 테스트
 - [ ] 실거래 테스트
+
+---
+
+## Part 6: 최종 결과
+
+### 배치 학습 vs 증분 학습 비교 (2026-02-03)
+
+| 학습 방식 | er>0.001 PF | er>0.001 Expectancy | 결론 |
+|----------|-------------|---------------------|------|
+| **배치 학습** | **2.64** | **+0.30%** | **최고 성능** |
+| 증분 학습 | 0.71 | -0.07% | 성능 저하 |
+
+**결론**: 증분 학습(심볼별 init_model)은 메모리 절약에는 좋지만 성능이 크게 저하됨.
+배치 학습(전체 데이터 한번에)을 권장.
+
+### 최종 권장 설정
+
+```python
+# scripts/train_30_symbols.py 사용
+cfg = ImprovedTrainConfig(
+    use_multi_tf=True,           # 멀티 타임프레임
+    use_optuna=True,             # Optuna 튜닝
+    optuna_trials=50,            # 50 trials × 4 targets
+    use_feature_selection=True,  # 피처 선택
+    feature_importance_threshold=0.001,  # 99.9% 누적 중요도
+    use_meta_labeling=True,      # Meta-labeling
+    use_catboost_ensemble=True,  # CatBoost 앙상블
+)
+```
+
+### 최고 결과
+
+- **PF**: 2.64
+- **Expectancy**: +0.30%
+- **필터**: er>0.001
+- **거래 수**: 25,993건 (검증 기간)
 
 ---
 

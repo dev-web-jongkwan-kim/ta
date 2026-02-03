@@ -45,23 +45,20 @@ except ImportError:
 Timeframe = Literal["1m", "15m", "1h"]
 
 # ============================================================================
-# 저메모리 LightGBM 파라미터
+# LightGBM 기본 파라미터 (최적값)
 # ============================================================================
-LGBM_LOW_MEMORY_PARAMS = {
+LGBM_DEFAULT_PARAMS = {
     "objective": "regression",
-    "n_estimators": 300,
+    "n_estimators": 500,
     "learning_rate": 0.05,
-    "num_leaves": 31,
-    "max_depth": 6,
-    "max_bin": 63,
-    "min_data_in_leaf": 100,
-    "feature_fraction": 0.7,
-    "bagging_fraction": 0.7,
-    "bagging_freq": 5,
+    "num_leaves": 64,
+    "max_depth": 8,
+    "min_child_samples": 20,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
     "reg_alpha": 0.1,
     "reg_lambda": 0.1,
     "verbose": -1,
-    "force_col_wise": True,
 }
 
 
@@ -78,11 +75,11 @@ class OptimizedTrainConfig:
 
     # 최적화 옵션
     use_optuna: bool = True
-    optuna_trials: int = 30
-    optuna_single_target: bool = True  # 대표 타겟만 튜닝
+    optuna_trials: int = 50  # 원래 값 복원
+    optuna_per_target: bool = True  # 타겟별 개별 튜닝
 
     use_feature_selection: bool = True
-    top_n_features: int = 50
+    feature_importance_threshold: float = 0.001  # 누적 중요도 99.9% 기준
 
     use_meta_labeling: bool = True
     use_catboost_ensemble: bool = False  # 저사양에서는 비활성화 권장
@@ -242,7 +239,7 @@ def _merge_higher_tf_features(
 
 
 # ============================================================================
-# Feature Selection (캐싱)
+# Feature Selection (누적 중요도 99.9% 기준)
 # ============================================================================
 
 _feature_selection_cache: Dict[str, List[str]] = {}
@@ -251,10 +248,10 @@ _feature_selection_cache: Dict[str, List[str]] = {}
 def select_features_cached(
     X: pd.DataFrame,
     y: pd.Series,
-    top_n: int = 50,
+    threshold: float = 0.001,  # 하위 0.1% 제거 = 상위 99.9% 선택
     cache_key: str = None
 ) -> List[str]:
-    """피처 선택 (캐싱으로 중복 계산 방지)"""
+    """피처 선택 (누적 중요도 기준, 캐싱으로 중복 계산 방지)"""
     global _feature_selection_cache
 
     if cache_key and cache_key in _feature_selection_cache:
@@ -264,10 +261,9 @@ def select_features_cached(
 
     # Quick LightGBM으로 중요도 계산
     model = lgb.LGBMRegressor(
-        n_estimators=50,
+        n_estimators=100,
         learning_rate=0.1,
-        num_leaves=16,
-        max_bin=63,
+        num_leaves=32,
         verbose=-1,
     )
 
@@ -282,9 +278,23 @@ def select_features_cached(
     importances = pd.DataFrame({
         "feature": X.columns,
         "importance": model.feature_importances_
-    }).sort_values("importance", ascending=False)
+    })
+    importances["importance_pct"] = importances["importance"] / importances["importance"].sum()
+    importances = importances.sort_values("importance", ascending=False)
 
-    selected = importances.head(top_n)["feature"].tolist()
+    # 누적 중요도가 99.9%가 될 때까지 피처 추가
+    cumsum = 0
+    selected = []
+    for _, row in importances.iterrows():
+        if cumsum < (1 - threshold):  # 99.9% 미만이면 계속 추가
+            selected.append(row["feature"])
+            cumsum += row["importance_pct"]
+        else:
+            break
+
+    # 최소 10개 피처는 유지
+    if len(selected) < 10:
+        selected = importances.head(10)["feature"].tolist()
 
     if cache_key:
         _feature_selection_cache[cache_key] = selected
@@ -296,42 +306,46 @@ def select_features_cached(
 
 
 # ============================================================================
-# Optuna 최적화 (단일 타겟)
+# Optuna 최적화 (타겟별 개별 튜닝)
 # ============================================================================
 
-def optimize_lgbm_single(
+def optimize_lgbm_params(
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
-    n_trials: int = 30,
+    objective: str = "regression",
+    n_trials: int = 50,
+    alpha: float = None,
 ) -> Dict[str, Any]:
-    """단일 타겟에 대해 Optuna 최적화"""
+    """Optuna를 사용한 LightGBM 하이퍼파라미터 최적화 (원래 범위 복원)"""
     if not OPTUNA_AVAILABLE:
         print("  Optuna not available, using default params")
-        return LGBM_LOW_MEMORY_PARAMS.copy()
+        return LGBM_DEFAULT_PARAMS.copy()
 
-    def objective(trial):
+    def objective_func(trial):
         params = {
-            "objective": "regression",
-            "n_estimators": trial.suggest_int("n_estimators", 100, 400),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 16, 64),
-            "max_depth": trial.suggest_int("max_depth", 4, 8),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 200),
-            "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 0.9),
-            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.9),
-            "bagging_freq": 5,
-            "max_bin": 63,
+            "objective": objective,
+            "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 256),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
             "verbose": -1,
         }
+        if objective == "quantile" and alpha is not None:
+            params["alpha"] = alpha
 
         model = lgb.LGBMRegressor(**params)
         model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
             callbacks=[
-                lgb.early_stopping(stopping_rounds=20, verbose=False),
+                lgb.early_stopping(stopping_rounds=30, verbose=False),
                 lgb.log_evaluation(period=0),
             ],
         )
@@ -339,16 +353,16 @@ def optimize_lgbm_single(
         return float(np.sqrt(mean_squared_error(y_val, pred)))
 
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective_func, n_trials=n_trials, show_progress_bar=False)
 
     best_params = study.best_params
-    best_params["objective"] = "regression"
-    best_params["max_bin"] = 63
-    best_params["bagging_freq"] = 5
+    best_params["objective"] = objective
     best_params["verbose"] = -1
+    if objective == "quantile" and alpha is not None:
+        best_params["alpha"] = alpha
 
     print(f"  Best params (RMSE={study.best_value:.4f}): lr={best_params['learning_rate']:.4f}, "
-          f"leaves={best_params['num_leaves']}")
+          f"leaves={best_params['num_leaves']}, depth={best_params['max_depth']}")
 
     return best_params
 
@@ -512,7 +526,8 @@ def run_optimized_training(
     print("=" * 60)
     print(f"심볼: {len(symbols)}개")
     print(f"float32: {cfg.use_float32}")
-    print(f"Optuna trials: {cfg.optuna_trials} (단일 타겟: {cfg.optuna_single_target})")
+    print(f"Optuna trials: {cfg.optuna_trials} (타겟별 튜닝: {cfg.optuna_per_target})")
+    print(f"Feature Selection: 누적 중요도 {(1-cfg.feature_importance_threshold)*100:.1f}%")
 
     # ========================================================================
     # Step 1: 첫 심볼로 피처 컬럼 및 Optuna 파라미터 결정
@@ -548,30 +563,59 @@ def run_optimized_training(
     if train_first.empty or val_first.empty:
         return {"status": "error", "message": "Insufficient data for train/val split"}
 
-    # Feature Selection
+    # Feature Selection (누적 중요도 99.9% 기준)
     if cfg.use_feature_selection:
         X_for_selection = train_first[all_feature_cols].fillna(0).replace([np.inf, -np.inf], 0)
         y_for_selection = train_first["ret_net"].fillna(0)
 
         cache_key = hashlib.md5(f"{cfg.label_spec_hash}_{cfg.feature_schema_version}".encode()).hexdigest()
         selected_features = select_features_cached(X_for_selection, y_for_selection,
-                                                   top_n=cfg.top_n_features, cache_key=cache_key)
-        print(f"  선택된 피처: {len(selected_features)}개")
+                                                   threshold=cfg.feature_importance_threshold, cache_key=cache_key)
+        print(f"  선택된 피처: {len(selected_features)}개 (누적 중요도 {(1-cfg.feature_importance_threshold)*100:.1f}%)")
     else:
         selected_features = all_feature_cols
 
-    # Optuna 튜닝 (단일 타겟: ret_net)
-    if cfg.use_optuna:
-        X_train = train_first[selected_features].fillna(0).replace([np.inf, -np.inf], 0).values.astype(np.float32)
+    # Train/Val 데이터 준비 (Optuna 및 이후 학습에 사용)
+    X_train_opt = train_first[selected_features].fillna(0).replace([np.inf, -np.inf], 0).values.astype(np.float32)
+    X_val_opt = val_first[selected_features].fillna(0).replace([np.inf, -np.inf], 0).values.astype(np.float32)
+
+    # 타겟별 Optuna 파라미터 저장
+    target_params = {}
+    target_map = {
+        "er_long": "ret_net",
+        "q05_long": "ret_net",
+        "e_mae_long": "mae",
+        "e_hold_long": "time_to_event_min",
+    }
+
+    if cfg.use_optuna and cfg.optuna_per_target:
+        print("\n  타겟별 Optuna 튜닝 시작...")
+        for target in cfg.targets:
+            raw_target = target_map.get(target, target)
+            y_train_t = train_first[raw_target].fillna(0).values.astype(np.float32)
+            y_val_t = val_first[raw_target].fillna(0).values.astype(np.float32)
+
+            objective = "quantile" if target == "q05_long" else "regression"
+            alpha = 0.05 if target == "q05_long" else None
+
+            print(f"\n  --- {target} ---")
+            params = optimize_lgbm_params(
+                X_train_opt, y_train_t, X_val_opt, y_val_t,
+                objective=objective, n_trials=cfg.optuna_trials, alpha=alpha
+            )
+            target_params[target] = params
+    elif cfg.use_optuna:
+        # 단일 타겟만 튜닝 (이전 방식 - 권장하지 않음)
         y_train = train_first["ret_net"].fillna(0).values.astype(np.float32)
-        X_val = val_first[selected_features].fillna(0).replace([np.inf, -np.inf], 0).values.astype(np.float32)
         y_val = val_first["ret_net"].fillna(0).values.astype(np.float32)
-
-        best_params = optimize_lgbm_single(X_train, y_train, X_val, y_val, n_trials=cfg.optuna_trials)
+        best_params = optimize_lgbm_params(X_train_opt, y_train, X_val_opt, y_val, n_trials=cfg.optuna_trials)
+        for target in cfg.targets:
+            target_params[target] = best_params.copy()
     else:
-        best_params = LGBM_LOW_MEMORY_PARAMS.copy()
+        for target in cfg.targets:
+            target_params[target] = LGBM_DEFAULT_PARAMS.copy()
 
-    del df_first, train_first, val_first
+    del df_first, train_first, val_first, X_train_opt, X_val_opt
     gc.collect()
 
     # ========================================================================
@@ -580,21 +624,12 @@ def run_optimized_training(
     print("\n[2/5] 심볼별 증분 학습...")
 
     models = {}
-    target_map = {
-        "er_long": "ret_net",
-        "q05_long": "ret_net",
-        "e_mae_long": "mae",
-        "e_hold_long": "time_to_event_min",
-    }
 
     for target in cfg.targets:
         print(f"\n  --- {target} ---")
 
-        # 타겟별 파라미터 조정
-        params = best_params.copy()
-        if target == "q05_long":
-            params["objective"] = "quantile"
-            params["alpha"] = 0.05
+        # 타겟별 최적화된 파라미터 사용
+        params = target_params[target].copy()
 
         model = train_incremental_by_symbol(
             cfg=cfg,
