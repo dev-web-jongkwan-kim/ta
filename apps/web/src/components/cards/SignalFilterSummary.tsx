@@ -26,15 +26,12 @@ export default function SignalFilterSummary() {
       try {
         const apiBase = getClientApiBase();
 
-        // Fetch signals
         const signalsRes = await fetch(`${apiBase}/api/signals/latest?limit=100`);
         const signals = await signalsRes.json();
 
-        // Fetch settings for thresholds
         const settingsRes = await fetch(`${apiBase}/api/settings`);
         const settings = await settingsRes.json();
 
-        // Calculate stats
         const byReason: Record<string, number> = {};
         let passed = 0;
         let blocked = 0;
@@ -54,13 +51,7 @@ export default function SignalFilterSummary() {
           }
         }
 
-        setStats({
-          total: signals.length,
-          passed,
-          blocked,
-          byReason,
-        });
-
+        setStats({ total: signals.length, passed, blocked, byReason });
         setThresholds({
           EV_MIN: settings.ev_min ?? 0,
           Q05_MIN: settings.q05_min ?? -0.002,
@@ -80,75 +71,95 @@ export default function SignalFilterSummary() {
 
   if (loading) {
     return (
-      <div className="rounded-2xl bg-white/80 p-6 shadow-sm border border-ink/5">
-        <h3 className="font-display text-lg">Signal Filters</h3>
-        <div className="mt-4 text-sm text-slate">Loading...</div>
+      <div className="card p-5">
+        <h3 className="font-display font-semibold text-foreground mb-4">Signal Filters</h3>
+        <div className="space-y-2">
+          <div className="skeleton h-8 rounded" />
+          <div className="skeleton h-8 rounded" />
+          <div className="skeleton h-8 rounded" />
+        </div>
       </div>
     );
   }
 
   const reasonLabels: Record<string, string> = {
     EV_MIN: "EV too low",
-    Q05_MIN: "Q05 risk too high",
-    MAE_MAX: "MAE too high",
+    Q05_MIN: "Q05 risk",
+    MAE_MAX: "MAE high",
     MISSING_BLOCK: "Missing data",
-    DAILY_LOSS: "Daily loss limit",
+    DAILY_LOSS: "Daily loss",
     MAX_POSITIONS: "Max positions",
   };
 
-  return (
-    <div className="rounded-2xl bg-white/80 p-6 shadow-sm border border-ink/5">
-      <h3 className="font-display text-lg">Signal Filters</h3>
+  const passRate = stats ? Math.round((stats.passed / stats.total) * 100) || 0 : 0;
 
-      {/* Summary */}
-      <div className="mt-4 grid grid-cols-3 gap-4 text-center">
-        <div>
-          <div className="text-2xl font-display">{stats?.total ?? 0}</div>
-          <div className="text-xs text-slate">Total</div>
+  return (
+    <div className="card p-5">
+      <h3 className="font-display font-semibold text-foreground mb-4">Signal Filters</h3>
+
+      {/* Summary Stats */}
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="text-center">
+          <div className="font-mono text-xl font-semibold text-foreground">{stats?.total ?? 0}</div>
+          <div className="metric-label">Total</div>
         </div>
-        <div>
-          <div className="text-2xl font-display text-emerald-600">{stats?.passed ?? 0}</div>
-          <div className="text-xs text-slate">Passed</div>
+        <div className="text-center">
+          <div className="font-mono text-xl font-semibold text-success">{stats?.passed ?? 0}</div>
+          <div className="metric-label">Passed</div>
         </div>
-        <div>
-          <div className="text-2xl font-display text-rose-500">{stats?.blocked ?? 0}</div>
-          <div className="text-xs text-slate">Blocked</div>
+        <div className="text-center">
+          <div className="font-mono text-xl font-semibold text-danger">{stats?.blocked ?? 0}</div>
+          <div className="metric-label">Blocked</div>
+        </div>
+      </div>
+
+      {/* Pass Rate Bar */}
+      <div className="mb-4">
+        <div className="flex justify-between text-xs mb-1">
+          <span className="text-foreground-muted">Pass Rate</span>
+          <span className="font-mono text-foreground">{passRate}%</span>
+        </div>
+        <div className="h-2 bg-background-tertiary rounded-full overflow-hidden">
+          <div
+            className="h-full bg-success rounded-full transition-all duration-300"
+            style={{ width: `${passRate}%` }}
+          />
         </div>
       </div>
 
       {/* Block Reasons */}
-      <div className="mt-4 space-y-2">
-        <div className="text-xs font-medium text-slate uppercase">Block Reasons</div>
-        {stats && Object.entries(stats.byReason)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 5)
-          .map(([reason, count]) => (
-            <div key={reason} className="flex items-center justify-between text-sm">
-              <span className="text-slate">{reasonLabels[reason] || reason}</span>
-              <span className="font-medium">{count}</span>
-            </div>
-          ))
-        }
-      </div>
+      {stats && Object.keys(stats.byReason).length > 0 && (
+        <div className="space-y-1.5 pt-3 border-t border-border">
+          <div className="metric-label mb-2">Block Reasons</div>
+          {Object.entries(stats.byReason)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 4)
+            .map(([reason, count]) => (
+              <div key={reason} className="flex items-center justify-between text-sm">
+                <span className="text-foreground-secondary">{reasonLabels[reason] || reason}</span>
+                <span className="badge badge-danger">{count}</span>
+              </div>
+            ))}
+        </div>
+      )}
 
       {/* Thresholds */}
-      <div className="mt-4 pt-4 border-t border-ink/10 space-y-2">
-        <div className="text-xs font-medium text-slate uppercase">Current Thresholds</div>
-        <div className="grid grid-cols-3 gap-2 text-xs">
-          <div className="bg-mist rounded-lg p-2 text-center">
-            <div className="font-medium">EV_MIN</div>
-            <div className="text-slate">{((thresholds?.EV_MIN ?? 0) * 100).toFixed(2)}%</div>
+      {thresholds && (
+        <div className="grid grid-cols-3 gap-2 mt-4 pt-3 border-t border-border">
+          <div className="bg-background-tertiary/50 rounded p-2 text-center">
+            <div className="text-2xs text-foreground-muted">EV_MIN</div>
+            <div className="font-mono text-xs text-foreground">{((thresholds.EV_MIN) * 100).toFixed(2)}%</div>
           </div>
-          <div className="bg-mist rounded-lg p-2 text-center">
-            <div className="font-medium">Q05_MIN</div>
-            <div className="text-slate">{((thresholds?.Q05_MIN ?? 0) * 100).toFixed(2)}%</div>
+          <div className="bg-background-tertiary/50 rounded p-2 text-center">
+            <div className="text-2xs text-foreground-muted">Q05_MIN</div>
+            <div className="font-mono text-xs text-foreground">{((thresholds.Q05_MIN) * 100).toFixed(2)}%</div>
           </div>
-          <div className="bg-mist rounded-lg p-2 text-center">
-            <div className="font-medium">MAE_MAX</div>
-            <div className="text-slate">{((thresholds?.MAE_MAX ?? 0) * 100).toFixed(2)}%</div>
+          <div className="bg-background-tertiary/50 rounded p-2 text-center">
+            <div className="text-2xs text-foreground-muted">MAE_MAX</div>
+            <div className="font-mono text-xs text-foreground">{((thresholds.MAE_MAX) * 100).toFixed(2)}%</div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

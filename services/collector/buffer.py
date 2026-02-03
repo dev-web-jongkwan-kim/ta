@@ -14,12 +14,20 @@ class IngestBuffer:
         self.flush_batch_size = settings.flush_batch_size
         self._last_flush = time.time()
         self.candles: List[Tuple] = []
+        self.candles_15m: List[Tuple] = []
+        self.candles_1h: List[Tuple] = []
         self.premium: List[Tuple] = []
         self.open_interest: List[Tuple] = []
         self.long_short_ratio: List[Tuple] = []
 
     def add_candle(self, row: Tuple) -> None:
         self.candles.append(row)
+
+    def add_candle_15m(self, row: Tuple) -> None:
+        self.candles_15m.append(row)
+
+    def add_candle_1h(self, row: Tuple) -> None:
+        self.candles_1h.append(row)
 
     def add_premium(self, row: Tuple) -> None:
         self.premium.append(row)
@@ -31,7 +39,14 @@ class IngestBuffer:
         self.long_short_ratio.append(row)
 
     def should_flush(self) -> bool:
-        total = len(self.candles) + len(self.premium) + len(self.open_interest) + len(self.long_short_ratio)
+        total = (
+            len(self.candles)
+            + len(self.candles_15m)
+            + len(self.candles_1h)
+            + len(self.premium)
+            + len(self.open_interest)
+            + len(self.long_short_ratio)
+        )
         if total >= self.flush_batch_size:
             return True
         return (time.time() - self._last_flush) >= self.flush_interval_sec
@@ -46,6 +61,24 @@ class IngestBuffer:
                 update_cols=["open", "high", "low", "close", "volume"],
             )
             self.candles.clear()
+        if self.candles_15m:
+            bulk_upsert(
+                "candles_15m",
+                ["symbol", "ts", "open", "high", "low", "close", "volume"],
+                self.candles_15m,
+                conflict_cols=["symbol", "ts"],
+                update_cols=["open", "high", "low", "close", "volume"],
+            )
+            self.candles_15m.clear()
+        if self.candles_1h:
+            bulk_upsert(
+                "candles_1h",
+                ["symbol", "ts", "open", "high", "low", "close", "volume"],
+                self.candles_1h,
+                conflict_cols=["symbol", "ts"],
+                update_cols=["open", "high", "low", "close", "volume"],
+            )
+            self.candles_1h.clear()
         if self.premium:
             bulk_upsert(
                 "premium_index",

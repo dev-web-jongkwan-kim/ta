@@ -1,4 +1,7 @@
-import { fetchJSON } from "@/lib/api";
+"use client";
+
+import { useEffect, useState } from "react";
+import { getClientApiBase } from "@/lib/client-api";
 
 interface TrainingJob {
   job_id: string;
@@ -10,68 +13,96 @@ interface TrainingJob {
   error: string | null;
 }
 
-export default async function TrainingJobsTable() {
-  let jobs: TrainingJob[] = [];
-  try {
-    jobs = await fetchJSON("/api/training/jobs");
-  } catch (e) {
-    console.error("Failed to fetch training jobs:", e);
-  }
+export default function TrainingJobsTable() {
+  const [jobs, setJobs] = useState<TrainingJob[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const getStatusColor = (status: string) => {
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const apiBase = getClientApiBase();
+        const res = await fetch(`${apiBase}/api/training/jobs`);
+        if (!res.ok) throw new Error("Failed to fetch");
+        const data = await res.json();
+        setJobs(data);
+      } catch (e) {
+        console.error("Failed to fetch training jobs:", e);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+    const interval = setInterval(fetchData, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const getStatusBadge = (status: string) => {
     switch (status) {
       case "completed":
-        return "bg-emerald-100 text-emerald-700";
+        return "badge-success";
       case "running":
-        return "bg-blue-100 text-blue-700";
+        return "bg-accent-muted text-accent";
       case "failed":
-        return "bg-red-100 text-red-700";
+        return "badge-danger";
       case "queued":
-        return "bg-yellow-100 text-yellow-700";
+        return "badge-warning";
       default:
-        return "bg-gray-100 text-gray-600";
+        return "badge-neutral";
     }
   };
 
   return (
-    <div className="rounded-2xl bg-white/80 p-6 shadow-sm border border-ink/5">
-      <h3 className="font-display text-lg">Training Jobs</h3>
-      <table className="mt-4 w-full text-sm">
-        <thead className="text-slate">
-          <tr className="text-left">
-            <th className="py-2">Job</th>
-            <th className="py-2">Status</th>
-            <th className="py-2">Created</th>
-            <th className="py-2">Error</th>
-          </tr>
-        </thead>
-        <tbody>
-          {jobs.length === 0 ? (
-            <tr>
-              <td colSpan={4} className="py-4 text-center text-slate">
-                No training jobs found
-              </td>
-            </tr>
-          ) : (
-            jobs.slice(0, 10).map((job) => (
-              <tr key={job.job_id} className="border-t border-ink/5">
-                <td className="py-3 font-display text-xs">{job.job_id.slice(0, 8)}...</td>
-                <td className="py-3">
-                  <span className={`px-2 py-1 rounded-full text-xs ${getStatusColor(job.status)}`}>
-                    {job.status}
-                  </span>
-                </td>
-                <td className="py-3 text-slate text-xs">
-                  {new Date(job.created_at).toLocaleString()}
-                </td>
-                <td className="py-3 text-red-500 text-xs truncate max-w-[150px]">
-                  {job.error || "-"}
-                </td>
+    <div className="card p-5">
+      <h3 className="font-display font-semibold text-foreground mb-4">Training Jobs</h3>
+
+      {loading ? (
+        <div className="space-y-2">
+          <div className="skeleton h-10 rounded" />
+          <div className="skeleton h-10 rounded" />
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left border-b border-border">
+                <th className="table-header pb-2">Job</th>
+                <th className="table-header pb-2">Status</th>
+                <th className="table-header pb-2">Created</th>
+                <th className="table-header pb-2">Error</th>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            </thead>
+            <tbody>
+              {jobs.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="py-6 text-center text-foreground-muted">
+                    No training jobs found
+                  </td>
+                </tr>
+              ) : (
+                jobs.slice(0, 10).map((job) => (
+                  <tr key={job.job_id} className="table-row">
+                    <td className="py-2.5 font-mono text-xs text-foreground">
+                      {job.job_id.slice(0, 8)}...
+                    </td>
+                    <td className="py-2.5">
+                      <span className={`badge ${getStatusBadge(job.status)}`}>
+                        {job.status}
+                      </span>
+                    </td>
+                    <td className="py-2.5 text-foreground-muted text-xs">
+                      {new Date(job.created_at).toLocaleString()}
+                    </td>
+                    <td className="py-2.5 text-danger text-xs truncate max-w-[150px]">
+                      {job.error || "-"}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

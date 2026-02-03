@@ -11,6 +11,7 @@ from packages.common.db import execute, fetch_all
 from packages.common.portfolio import get_portfolio_metrics
 from packages.common.runtime import get_collector_ok, get_mode, get_userstream_ok, set_mode
 from packages.common.types import StatusDTO
+from packages.common.ws_status import get_ws_status
 
 app = FastAPI()
 app.add_middleware(
@@ -40,6 +41,12 @@ def status() -> StatusDTO:
         exposures=exposures,
         mode=get_mode(),
     )
+
+
+@app.get("/api/websocket/status")
+def websocket_status() -> Dict[str, Any]:
+    """Get websocket connection status."""
+    return get_ws_status()
 
 
 @app.get("/api/universe")

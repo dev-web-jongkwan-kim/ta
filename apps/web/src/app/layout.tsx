@@ -1,28 +1,64 @@
 import "./globals.css";
 import type { ReactNode } from "react";
-import { Space_Grotesk, Sora } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
+import { ThemeProvider } from "@/contexts/ThemeContext";
+import { ToastProvider } from "@/contexts/ToastContext";
 import Sidebar from "@/components/layout/Sidebar";
 import Topbar from "@/components/layout/Topbar";
+import WebSocketMonitor from "@/components/monitors/WebSocketMonitor";
 
-const display = Space_Grotesk({ subsets: ["latin"], variable: "--font-display" });
-const body = Sora({ subsets: ["latin"], variable: "--font-body" });
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-body",
+  display: "swap",
+});
+
+const jetbrains = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono",
+  display: "swap",
+});
 
 export const metadata = {
   title: "TA Ops",
-  description: "Trading ops dashboard",
+  description: "Trading operations dashboard",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" className={`${display.variable} ${body.variable}`}>
-      <body>
-        <div className="flex min-h-screen">
-          <Sidebar />
-          <div className="flex-1">
-            <Topbar />
-            <main className="px-8 py-6">{children}</main>
-          </div>
-        </div>
+    <html
+      lang="en"
+      className={`${inter.variable} ${jetbrains.variable}`}
+      suppressHydrationWarning
+    >
+      <head>
+        {/* Prevent flash of wrong theme */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                const stored = localStorage.getItem('ta-theme');
+                const theme = stored === 'dark' || stored === 'light' ? stored :
+                  (stored === 'system' || !stored) && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.classList.add(theme);
+              })();
+            `,
+          }}
+        />
+      </head>
+      <body className="font-body">
+        <ThemeProvider>
+          <ToastProvider>
+            <WebSocketMonitor />
+            <div className="flex min-h-screen">
+              <Sidebar />
+              <div className="flex-1 flex flex-col min-w-0">
+                <Topbar />
+                <main className="flex-1 p-6 overflow-auto">{children}</main>
+              </div>
+            </div>
+          </ToastProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

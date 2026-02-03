@@ -1,23 +1,41 @@
-const modeLabels: Record<string, { label: string; tone: string; desc: string }> = {
-  live: { label: "Live", tone: "bg-emerald/10 text-emerald", desc: "Real orders active" },
-  shadow: { label: "Shadow", tone: "bg-amber/10 text-amber", desc: "Simulated orders" },
-  off: { label: "Off", tone: "bg-rose/10 text-rose", desc: "Trading disabled" },
+const modeConfig: Record<string, { label: string; dotClass: string; badgeClass: string; desc: string }> = {
+  live: {
+    label: "LIVE",
+    dotClass: "status-dot-success",
+    badgeClass: "badge-success",
+    desc: "Real orders active",
+  },
+  shadow: {
+    label: "SHADOW",
+    dotClass: "status-dot-warning",
+    badgeClass: "badge-warning",
+    desc: "Simulated orders",
+  },
+  off: {
+    label: "OFF",
+    dotClass: "status-dot-danger",
+    badgeClass: "badge-danger",
+    desc: "Trading disabled",
+  },
 };
 
 export default function ModeIndicator({ mode }: { mode: string }) {
-  const { label, tone, desc } = modeLabels[mode] ?? {
+  const config = modeConfig[mode] ?? {
     label: mode.toUpperCase(),
-    tone: "bg-slate/10 text-slate",
-    desc: "Runtime mode",
+    dotClass: "status-dot-muted",
+    badgeClass: "badge-neutral",
+    desc: "Unknown mode",
   };
+
   return (
-    <div className="rounded-2xl bg-white/90 p-6 shadow-sm border border-ink/5">
+    <div className="card p-5">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-display font-semibold text-foreground">Runtime Mode</h3>
+        <span className={`status-dot ${config.dotClass}`} />
+      </div>
       <div className="flex items-center justify-between">
-        <div>
-          <p className="font-display text-lg">Runtime Mode</p>
-          <p className="text-sm text-slate">{desc}</p>
-        </div>
-        <span className={`rounded-full px-3 py-1 text-sm font-semibold ${tone}`}>{label}</span>
+        <span className="text-sm text-foreground-muted">{config.desc}</span>
+        <span className={`badge ${config.badgeClass}`}>{config.label}</span>
       </div>
     </div>
   );

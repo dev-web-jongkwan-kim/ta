@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     binance_api_key: str = ""
     binance_api_secret: str = ""
     binance_testnet: bool = True
+    binance_futures_ws_url: str = "wss://fstream.binance.com"  # or wss://stream.binancefuture.com for testnet
 
     universe: str = "BTCUSDT,ETHUSDT"
 
