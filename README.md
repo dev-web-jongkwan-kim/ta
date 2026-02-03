@@ -89,6 +89,8 @@ Live trading requires API keys and `mode=live`. Shadow mode does not place real 
 
 ## Labeling + Training
 
+### 기본 학습
+
 ```bash
 python services/labeling/run_labeling.py
 
@@ -109,6 +111,68 @@ INSERT INTO training_jobs (job_id, status, config) VALUES (
     \"embargo_pct\":0.0
   }'
 );"
+```
+
+### 개선된 학습 파이프라인 (v3)
+
+멀티 타임프레임 + Phase 1/2 개선사항을 적용한 학습:
+
+```bash
+# 멀티 타임프레임 마이그레이션 (최초 1회)
+psql postgresql://ta:ta@localhost:5433/ta -f infra/migrations/011_multi_timeframe.sql
+
+# Phase 1 + Phase 2 개선된 학습 실행
+python scripts/train_phase1_phase2.py
+
+# 옵션
+python scripts/train_phase1_phase2.py --optuna-trials 50  # Optuna 시행 횟수
+python scripts/train_phase1_phase2.py --skip-tb-opt       # Triple Barrier 최적화 스킵
+python scripts/train_phase1_phase2.py --skip-meta         # Meta-labeling 스킵
+```
+
+#### 멀티 타임프레임 피처
+
+3개 타임프레임(1m, 15m, 1h)의 피처를 결합하여 학습:
+
+- **1분봉**: 실시간 시장 상태 (ADX, RSI, ATR, 펀딩율 등)
+- **15분봉**: 중기 추세 및 변동성
+- **1시간봉**: 장기 추세 및 레짐
+
+새로운 피처:
+- `atr_percentile`: 변동성 백분위
+- `trend_strength`: ADX와 RSI 기반 추세 강도
+- `hour_of_day`, `day_of_week`: 시간대 피처
+- `is_asia_session`, `is_us_session`: 세션 구분
+- `btc_lead_ret`, `eth_btc_spread`: 심볼 간 상관관계
+
+#### Phase 1 개선사항
+
+1. **Optuna 하이퍼파라미터 튜닝**: LightGBM 파라미터 자동 최적화
+2. **피처 선택**: Feature importance 기반 저중요도 피처 제거
+3. **클래스 불균형 처리**: scale_pos_weight 조정
+
+#### Phase 2 개선사항
+
+1. **Meta-labeling**: 1차 모델 예측에 대한 2차 필터 모델
+2. **Triple Barrier 최적화**: k_tp, k_sl, h_bars 파라미터 최적화
+3. **CatBoost 앙상블**: LightGBM(0.6) + CatBoost(0.4) 앙상블
+
+#### 성능 개선 결과
+
+| 필터 | Profit Factor | Expectancy | 거래 수 |
+|------|---------------|------------|---------|
+| Baseline | 0.71 | -0.09% | 129,600 |
+| er > 0 | 2.02 | +0.20% | 41,118 |
+| er > 0.001 | **2.64** | **+0.30%** | 25,412 |
+
+### 백테스트
+
+```bash
+# 모델 예측 기반 필터 백테스트
+python scripts/backtest_with_model.py
+
+# 필터 조합 테스트 (threshold, session, hour)
+python scripts/backtest_filters.py
 ```
 
 Completed training jobs now populate both `report_uri` (S3 path `s3://models/reports/{model_id}.json`) and `report_json` (stored in Postgres). The JSON payload contains PF, MDD, Expectancy, Tail loss, Turnover, regime splits, and cost breakdown so the UI can compare models and expose the training report.

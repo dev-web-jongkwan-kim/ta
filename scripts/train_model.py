@@ -19,7 +19,7 @@ def get_available_data_stats():
             MAX(f.ts) as max_ts
         FROM features_1m f
         JOIN labels_long_1m l ON f.symbol = l.symbol AND f.ts = l.ts
-        WHERE f.schema_version = 1
+        WHERE f.schema_version = 2
         AND f.symbol IN ('BTCUSDT', 'ETHUSDT')
     """)
     return rows[0] if rows else None
@@ -29,19 +29,19 @@ def main() -> None:
     print("=== 모델 훈련 시작 ===")
 
     # 훈련 기간 설정
-    # train: 300일, val: 30일
-    end_date = datetime(2026, 1, 31)
-    val_end = end_date
-    val_start = end_date - timedelta(days=30)
-    train_end = val_start
-    train_start = train_end - timedelta(days=300)
+    # 데이터 범위: 2026-01-03 ~ 2026-02-01
+    # train: 2026-01-03 ~ 2026-01-28, val: 2026-01-28 ~ 2026-02-01
+    train_start = datetime(2026, 1, 3)
+    train_end = datetime(2026, 1, 28)
+    val_start = datetime(2026, 1, 28)
+    val_end = datetime(2026, 2, 1)
 
     print(f"Train: {train_start.date()} ~ {train_end.date()}")
     print(f"Val: {val_start.date()} ~ {val_end.date()}")
 
     cfg = TrainConfig(
         label_spec_hash='722ababe946d22b0',
-        feature_schema_version=1,
+        feature_schema_version=2,
         train_start=train_start.strftime('%Y-%m-%d'),
         train_end=train_end.strftime('%Y-%m-%d'),
         val_start=val_start.strftime('%Y-%m-%d'),
