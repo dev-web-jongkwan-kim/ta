@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Models (large files)
+rl_models/
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# Node
+node_modules/
+.next/
+.turbo/
+
+# Test/Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Secrets
+*.pem
+*.key
+credentials.json
+secrets.json

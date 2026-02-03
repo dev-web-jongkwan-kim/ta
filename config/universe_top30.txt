@@ -1,0 +1,40 @@
+# Top 30 Coins by Trading Volume (Fixed Universe)
+# Last updated: 2026-02-01
+# Criteria: 24h Quote Volume, excluding stablecoins/gold/silver
+
+# Tier 1: Major Coins (Always included)
+BTCUSDT
+ETHUSDT
+BNBUSDT
+SOLUSDT
+XRPUSDT
+DOGEUSDT
+ADAUSDT
+
+# Tier 2: Large Cap
+AVAXUSDT
+DOTUSDT
+LINKUSDT
+LTCUSDT
+BCHUSDT
+SUIUSDT
+AAVEUSDT
+
+# Tier 3: Mid Cap High Volume
+1000PEPEUSDT
+FILUSDT
+AXSUSDT
+ENAUSDT
+ZKUSDT
+
+# Tier 4: Trending/High Volume
+ALPACAUSDT
+HYPEUSDT
+ZECUSDT
+BNXUSDT
+ALPHAUSDT
+ZORAUSDT
+TRUMPUSDT
+PUMPUSDT
+ENSOUSDT
+SYNUSDT

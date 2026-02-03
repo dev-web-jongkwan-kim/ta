@@ -1,0 +1,1 @@
+ALTER TABLE drift_metrics ADD COLUMN IF NOT EXISTS outlier_count INT NOT NULL DEFAULT 0;
