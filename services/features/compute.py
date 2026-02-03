@@ -91,6 +91,11 @@ def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return (direction * volume).cumsum()
 
 
+def _rolling_corr(s1: pd.Series, s2: pd.Series, window: int = 60) -> pd.Series:
+    """두 시계열의 롤링 상관관계"""
+    return s1.rolling(window=window, min_periods=window).corr(s2)
+
+
 def _trend_strength(adx: pd.Series, rsi: pd.Series) -> pd.Series:
     """추세 강도: ADX와 RSI 결합
 
@@ -227,6 +232,25 @@ def compute_features_for_symbol(
     else:
         df["eth_btc_spread"] = 0.0
 
+    # === 새로운 피처 5: Rolling Correlation (심볼-BTC 상관관계) ===
+    corr_window = max(30, 60 // tf_multiplier)  # 60분 기준
+    btc_ret_series = btc.set_index("ts")["close"].pct_change(1).reindex(df["ts"], method="ffill")
+
+    if symbol != "BTCUSDT":
+        df["btc_corr_60"] = _rolling_corr(df["ret_1"], btc_ret_series, window=corr_window)
+        # 상관관계 레짐 브레이크 (상관관계 < 0.3이면 디커플링)
+        df["corr_regime_break"] = (df["btc_corr_60"].abs() < 0.3).astype(int)
+    else:
+        df["btc_corr_60"] = 1.0
+        df["corr_regime_break"] = 0
+
+    # ETH 상관관계 (BTC, ETH 제외)
+    if eth_candles is not None and not eth_candles.empty and symbol not in ["BTCUSDT", "ETHUSDT"]:
+        eth_ret_series = eth.set_index("ts")["close"].pct_change(1).reindex(df["ts"], method="ffill")
+        df["eth_corr_60"] = _rolling_corr(df["ret_1"], eth_ret_series, window=corr_window)
+    else:
+        df["eth_corr_60"] = 0.0 if symbol == "BTCUSDT" else 1.0 if symbol == "ETHUSDT" else 0.0
+
     # Open Interest 피처
     oi_1h_window = max(1, 60 // tf_multiplier)
     oi_4h_window = max(1, 240 // tf_multiplier)
@@ -285,8 +309,9 @@ def compute_features_for_symbol(
         "funding_rate", "funding_z", "basis",
         # BTC 레짐 피처 (3개)
         "btc_ret_60", "btc_vol_60", "btc_regime",
-        # 심볼 상관관계 피처 (2개)
+        # 심볼 상관관계 피처 (5개)
         "btc_lead_ret", "eth_btc_spread",
+        "btc_corr_60", "corr_regime_break", "eth_corr_60",
         # Open Interest 피처 (3개)
         "oi_change_1h", "oi_change_4h", "oi_z",
         # Long/Short 비율 피처 (7개)
@@ -296,7 +321,7 @@ def compute_features_for_symbol(
     ]
 
     df["features"] = df[feature_cols].apply(lambda row: row.to_dict(), axis=1)
-    df["schema_version"] = 3  # 스키마 버전 업데이트 (멀티TF + 새 피처)
+    df["schema_version"] = 4  # 스키마 버전 업데이트 (멀티TF + Rolling Corr)
     return df[["symbol", "ts", "schema_version", "features", "atr", "funding_z", "btc_regime"]]
 
 
