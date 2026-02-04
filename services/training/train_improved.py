@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -77,6 +78,9 @@ class ImprovedTrainConfig:
     # Phase 2: CatBoost 앙상블
     use_catboost_ensemble: bool = True
     ensemble_weights: Tuple[float, float] = (0.6, 0.4)  # (lgbm, catboost)
+
+    # 병렬 학습 설정
+    parallel_workers: int = 2  # 동시 학습 타겟 수 (1=순차, 2+=병렬)
 
 
 def _trade_metrics(returns: pd.Series) -> Dict[str, float]:
@@ -142,16 +146,19 @@ def _load_multi_tf_dataset(
     all_feature_cols = None
 
     for symbol in symbols_list:
-        # 1m features + labels
+        # 1m features + labels (long + short)
         query_1m = """
             SELECT f.symbol, f.ts, f.features, f.schema_version, f.atr, f.funding_z, f.btc_regime,
-                   l.ret_net, l.mae, l.time_to_event_min, l.y
+                   ll.ret_net as ret_net_long, ll.mae as mae_long, ll.time_to_event_min as time_to_event_min_long, ll.y as y_long,
+                   ls.ret_net as ret_net_short, ls.mae as mae_short, ls.time_to_event_min as time_to_event_min_short, ls.y as y_short
             FROM features_1m f
-            JOIN labels_long_1m l
-              ON f.symbol = l.symbol AND f.ts = l.ts
-            WHERE f.schema_version = %s AND l.spec_hash = %s AND f.symbol = %s
+            JOIN labels_long_1m ll
+              ON f.symbol = ll.symbol AND f.ts = ll.ts
+            JOIN labels_short_1m ls
+              ON f.symbol = ls.symbol AND f.ts = ls.ts
+            WHERE f.schema_version = %s AND ll.spec_hash = %s AND ls.spec_hash = %s AND f.symbol = %s
         """
-        params: list = [feature_schema_version, label_spec_hash, symbol]
+        params: list = [feature_schema_version, label_spec_hash, label_spec_hash, symbol]
         if start_date:
             query_1m += " AND f.ts >= %s"
             params.append(start_date)
@@ -168,7 +175,8 @@ def _load_multi_tf_dataset(
             rows_1m,
             columns=[
                 "symbol", "ts", "features", "schema_version", "atr", "funding_z", "btc_regime",
-                "ret_net", "mae", "time_to_event_min", "y",
+                "ret_net_long", "mae_long", "time_to_event_min_long", "y_long",
+                "ret_net_short", "mae_short", "time_to_event_min_short", "y_short",
             ],
         )
         df_1m["ts"] = pd.to_datetime(df_1m["ts"], utc=True)
@@ -547,7 +555,7 @@ def run_improved_training(
     # Phase 1: 피처 선택
     if cfg.use_feature_selection:
         print("\n[2/7] 피처 선택 중...")
-        y_for_selection = train_df["ret_net"].fillna(0.0)
+        y_for_selection = train_df["ret_net_long"].fillna(0.0)
         selected_features = select_features(X_train, y_for_selection, cfg.feature_importance_threshold)
         print(f"  → {len(feature_cols)} → {len(selected_features)} 피처 선택")
         feature_cols = selected_features
@@ -556,35 +564,38 @@ def run_improved_training(
     else:
         print("\n[2/7] 피처 선택 스킵")
 
-    # 타겟 준비
+    # 타겟 준비 (롱 + 숏)
     target_map = {
-        "er_long": "ret_net",
-        "q05_long": "ret_net",
-        "e_mae_long": "mae",
-        "e_hold_long": "time_to_event_min",
+        "er_long": "ret_net_long",
+        "q05_long": "ret_net_long",
+        "e_mae_long": "mae_long",
+        "e_hold_long": "time_to_event_min_long",
+        "er_short": "ret_net_short",
+        "q05_short": "ret_net_short",
+        "e_mae_short": "mae_short",
+        "e_hold_short": "time_to_event_min_short",
     }
 
     metrics: Dict[str, Any] = {}
     models: Dict[str, Dict[str, Any]] = {}
 
-    # Phase 1: Optuna 하이퍼파라미터 튜닝 + 학습
-    print("\n[3/7] LightGBM 학습 (Optuna 튜닝)...")
-    for target in cfg.targets:
+    # 단일 타겟 학습 함수 (병렬 처리용)
+    def _train_single_target(target: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+        """단일 타겟 학습 - 병렬 처리를 위해 분리"""
         raw_target = target_map.get(target)
         if raw_target is None:
-            continue
+            return target, {}, {}
 
-        print(f"\n  --- {target} ---")
         objective = "quantile" if target.startswith("q05") else "regression"
         alpha = 0.05 if objective == "quantile" else None
 
-        y_train = train_df[raw_target].fillna(0.0).replace([np.inf, -np.inf], 0.0)
-        y_val = val_df[raw_target].fillna(0.0).replace([np.inf, -np.inf], 0.0)
+        y_train_target = train_df[raw_target].fillna(0.0).replace([np.inf, -np.inf], 0.0)
+        y_val_target = val_df[raw_target].fillna(0.0).replace([np.inf, -np.inf], 0.0)
 
         # Optuna 튜닝
         if cfg.use_optuna:
             best_params = optimize_lgbm_params(
-                X_train, y_train, X_val, y_val,
+                X_train, y_train_target, X_val, y_val_target,
                 objective=objective, n_trials=cfg.optuna_trials, alpha=alpha
             )
         else:
@@ -593,8 +604,8 @@ def run_improved_training(
         # LightGBM 학습
         lgbm_model = lgb.LGBMRegressor(**best_params)
         lgbm_model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
+            X_train, y_train_target,
+            eval_set=[(X_val, y_val_target)],
             callbacks=[
                 lgb.early_stopping(stopping_rounds=50, verbose=False),
                 lgb.log_evaluation(period=0),
@@ -602,42 +613,88 @@ def run_improved_training(
         )
 
         lgbm_pred = lgbm_model.predict(X_val)
-        lgbm_rmse = float(np.sqrt(mean_squared_error(y_val, lgbm_pred)))
-        print(f"  LightGBM RMSE: {lgbm_rmse:.4f}")
+        lgbm_rmse = float(np.sqrt(mean_squared_error(y_val_target, lgbm_pred)))
 
-        models[target] = {"lgbm": lgbm_model}
+        target_models = {"lgbm": lgbm_model}
+        final_pred = lgbm_pred
 
-        # Phase 2: CatBoost 앙상블
+        # CatBoost 앙상블
         if cfg.use_catboost_ensemble:
-            catboost_model = train_catboost_regressor(X_train, y_train, X_val, y_val)
+            catboost_model = train_catboost_regressor(X_train, y_train_target, X_val, y_val_target)
             if catboost_model:
-                models[target]["catboost"] = catboost_model
-
-                # 앙상블 예측
-                ensemble_pred = ensemble_predict(models[target], X_val, cfg.ensemble_weights)
-                ensemble_rmse = float(np.sqrt(mean_squared_error(y_val, ensemble_pred)))
-                print(f"  Ensemble RMSE: {ensemble_rmse:.4f}")
+                target_models["catboost"] = catboost_model
+                ensemble_pred = ensemble_predict(target_models, X_val, cfg.ensemble_weights)
+                ensemble_rmse = float(np.sqrt(mean_squared_error(y_val_target, ensemble_pred)))
                 final_pred = ensemble_pred
-            else:
-                final_pred = lgbm_pred
-        else:
-            final_pred = lgbm_pred
 
-        metrics[target] = {
-            "rmse": float(np.sqrt(mean_squared_error(y_val, final_pred))),
-            "mae": float(mean_absolute_error(y_val, final_pred)),
+        target_metrics = {
+            "rmse": float(np.sqrt(mean_squared_error(y_val_target, final_pred))),
+            "mae": float(mean_absolute_error(y_val_target, final_pred)),
             "best_iteration": lgbm_model.best_iteration_ if hasattr(lgbm_model, 'best_iteration_') else None,
             "params": best_params,
+            "lgbm_rmse": lgbm_rmse,
         }
+
+        return target, target_models, target_metrics
+
+    # Phase 1: Optuna 하이퍼파라미터 튜닝 + 학습
+    parallel_workers = cfg.parallel_workers if cfg.parallel_workers > 1 else 1
+    print(f"\n[3/7] LightGBM 학습 (Optuna 튜닝, {parallel_workers}개 병렬)...")
+
+    valid_targets = [t for t in cfg.targets if target_map.get(t) is not None]
+
+    if parallel_workers > 1:
+        # 병렬 학습
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            futures = {executor.submit(_train_single_target, t): t for t in valid_targets}
+            for future in as_completed(futures):
+                target = futures[future]
+                try:
+                    target_name, target_models, target_metrics = future.result()
+                    if target_models:
+                        models[target_name] = target_models
+                        metrics[target_name] = target_metrics
+                        lgbm_rmse = target_metrics.get("lgbm_rmse", target_metrics["rmse"])
+                        ensemble_rmse = target_metrics["rmse"]
+                        print(f"\n  --- {target_name} ---")
+                        print(f"  Best params (RMSE={lgbm_rmse:.4f}): lr={target_metrics['params'].get('learning_rate', 0):.4f}, "
+                              f"leaves={target_metrics['params'].get('num_leaves', 0)}, "
+                              f"depth={target_metrics['params'].get('max_depth', 0)}")
+                        print(f"  LightGBM RMSE: {lgbm_rmse:.4f}")
+                        if cfg.use_catboost_ensemble and "catboost" in target_models:
+                            cat_pred = target_models["catboost"].predict(X_val)
+                            cat_rmse = float(np.sqrt(mean_squared_error(val_df[target_map[target_name]].fillna(0.0), cat_pred)))
+                            print(f"  CatBoost RMSE: {cat_rmse:.4f}")
+                            print(f"  Ensemble RMSE: {ensemble_rmse:.4f}")
+                except Exception as e:
+                    print(f"\n  --- {target} --- ERROR: {e}")
+    else:
+        # 순차 학습 (기존 방식)
+        for target in valid_targets:
+            print(f"\n  --- {target} ---")
+            target_name, target_models, target_metrics = _train_single_target(target)
+            if target_models:
+                models[target_name] = target_models
+                metrics[target_name] = target_metrics
+                lgbm_rmse = target_metrics.get("lgbm_rmse", target_metrics["rmse"])
+                print(f"  Best params (RMSE={lgbm_rmse:.4f}): lr={target_metrics['params'].get('learning_rate', 0):.4f}, "
+                      f"leaves={target_metrics['params'].get('num_leaves', 0)}, "
+                      f"depth={target_metrics['params'].get('max_depth', 0)}")
+                print(f"  LightGBM RMSE: {lgbm_rmse:.4f}")
+                if cfg.use_catboost_ensemble and "catboost" in target_models:
+                    cat_pred = target_models["catboost"].predict(X_val)
+                    cat_rmse = float(np.sqrt(mean_squared_error(val_df[target_map[target_name]].fillna(0.0), cat_pred)))
+                    print(f"  CatBoost RMSE: {cat_rmse:.4f}")
+                    print(f"  Ensemble RMSE: {target_metrics['rmse']:.4f}")
 
     # Phase 2: Meta-labeling
     meta_model = None
     if cfg.use_meta_labeling and "er_long" in models:
         print("\n[4/7] Meta-labeling 모델 학습...")
 
-        # y 라벨 (TP 도달 여부)
-        y_train_binary = (train_df["y"] == 1).astype(int)
-        y_val_binary = (val_df["y"] == 1).astype(int)
+        # y 라벨 (TP 도달 여부) - 롱 포지션 기준
+        y_train_binary = (train_df["y_long"] == 1).astype(int)
+        y_val_binary = (val_df["y_long"] == 1).astype(int)
 
         # 1차 모델 예측
         er_model = models["er_long"]["lgbm"]
@@ -655,64 +712,105 @@ def run_improved_training(
 
     # 필터링된 거래 지표 계산
     print("\n[5/7] 거래 지표 계산...")
+    val_df = val_df.copy()
 
-    # 기본 지표
-    base_metrics = _trade_metrics(val_df["ret_net"].fillna(0.0))
-    print(f"  Baseline: PF={base_metrics['profit_factor']:.2f}, "
-          f"Expectancy={base_metrics['expectancy']*100:.2f}%, "
-          f"Trades={int(base_metrics['turnover']):,}")
+    # 롱 기본 지표
+    base_metrics_long = _trade_metrics(val_df["ret_net_long"].fillna(0.0))
+    print(f"  Baseline (Long): PF={base_metrics_long['profit_factor']:.2f}, "
+          f"Expectancy={base_metrics_long['expectancy']*100:.2f}%, "
+          f"Trades={int(base_metrics_long['turnover']):,}")
+
+    # 숏 기본 지표
+    base_metrics_short = _trade_metrics(val_df["ret_net_short"].fillna(0.0))
+    print(f"  Baseline (Short): PF={base_metrics_short['profit_factor']:.2f}, "
+          f"Expectancy={base_metrics_short['expectancy']*100:.2f}%, "
+          f"Trades={int(base_metrics_short['turnover']):,}")
 
     # er_long > 0 필터
     if "er_long" in models:
-        er_pred = ensemble_predict(models["er_long"], X_val, cfg.ensemble_weights) \
+        er_pred_long = ensemble_predict(models["er_long"], X_val, cfg.ensemble_weights) \
             if cfg.use_catboost_ensemble else models["er_long"]["lgbm"].predict(X_val)
-        val_df = val_df.copy()
-        val_df["er_pred"] = er_pred
+        val_df["er_pred_long"] = er_pred_long
 
-        # er > 0 필터
-        filtered_er = val_df[val_df["er_pred"] > 0]
-        er_metrics = _trade_metrics(filtered_er["ret_net"].fillna(0.0))
-        print(f"  er>0: PF={er_metrics['profit_factor']:.2f}, "
-              f"Expectancy={er_metrics['expectancy']*100:.2f}%, "
-              f"Trades={int(er_metrics['turnover']):,}")
+        # er_long > 0 필터
+        filtered_er_long = val_df[val_df["er_pred_long"] > 0]
+        er_metrics_long = _trade_metrics(filtered_er_long["ret_net_long"].fillna(0.0))
+        print(f"  Long er>0: PF={er_metrics_long['profit_factor']:.2f}, "
+              f"Expectancy={er_metrics_long['expectancy']*100:.2f}%, "
+              f"Trades={int(er_metrics_long['turnover']):,}")
 
-        # er > 0.001 필터
-        filtered_er_001 = val_df[val_df["er_pred"] > 0.001]
-        er_001_metrics = _trade_metrics(filtered_er_001["ret_net"].fillna(0.0))
-        print(f"  er>0.001: PF={er_001_metrics['profit_factor']:.2f}, "
-              f"Expectancy={er_001_metrics['expectancy']*100:.2f}%, "
-              f"Trades={int(er_001_metrics['turnover']):,}")
+        # er_long > 0.001 필터
+        filtered_er_001_long = val_df[val_df["er_pred_long"] > 0.001]
+        er_001_metrics_long = _trade_metrics(filtered_er_001_long["ret_net_long"].fillna(0.0))
+        print(f"  Long er>0.001: PF={er_001_metrics_long['profit_factor']:.2f}, "
+              f"Expectancy={er_001_metrics_long['expectancy']*100:.2f}%, "
+              f"Trades={int(er_001_metrics_long['turnover']):,}")
 
-        # Meta-labeling 필터
-        if meta_model is not None:
-            X_val_meta = X_val.copy()
-            X_val_meta["primary_pred"] = er_pred
-            meta_proba = meta_model.predict_proba(X_val_meta)[:, 1]
-            val_df["meta_proba"] = meta_proba
+        metrics["filtered_er0_long"] = er_metrics_long
+        metrics["filtered_er001_long"] = er_001_metrics_long
 
-            # er > 0 + meta > threshold
-            filtered_meta = val_df[(val_df["er_pred"] > 0) & (val_df["meta_proba"] > cfg.meta_threshold)]
-            meta_metrics = _trade_metrics(filtered_meta["ret_net"].fillna(0.0))
-            print(f"  er>0 + meta>{cfg.meta_threshold}: PF={meta_metrics['profit_factor']:.2f}, "
-                  f"Expectancy={meta_metrics['expectancy']*100:.2f}%, "
-                  f"Trades={int(meta_metrics['turnover']):,}")
+    # er_short > 0 필터
+    if "er_short" in models:
+        er_pred_short = ensemble_predict(models["er_short"], X_val, cfg.ensemble_weights) \
+            if cfg.use_catboost_ensemble else models["er_short"]["lgbm"].predict(X_val)
+        val_df["er_pred_short"] = er_pred_short
 
-            metrics["filtered_meta"] = meta_metrics
-        else:
-            meta_metrics = None
+        # er_short > 0 필터
+        filtered_er_short = val_df[val_df["er_pred_short"] > 0]
+        er_metrics_short = _trade_metrics(filtered_er_short["ret_net_short"].fillna(0.0))
+        print(f"  Short er>0: PF={er_metrics_short['profit_factor']:.2f}, "
+              f"Expectancy={er_metrics_short['expectancy']*100:.2f}%, "
+              f"Trades={int(er_metrics_short['turnover']):,}")
 
-        metrics["filtered_er0"] = er_metrics
-        metrics["filtered_er001"] = er_001_metrics
+        # er_short > 0.001 필터
+        filtered_er_001_short = val_df[val_df["er_pred_short"] > 0.001]
+        er_001_metrics_short = _trade_metrics(filtered_er_001_short["ret_net_short"].fillna(0.0))
+        print(f"  Short er>0.001: PF={er_001_metrics_short['profit_factor']:.2f}, "
+              f"Expectancy={er_001_metrics_short['expectancy']*100:.2f}%, "
+              f"Trades={int(er_001_metrics_short['turnover']):,}")
 
-    metrics["trade"] = base_metrics
+        metrics["filtered_er0_short"] = er_metrics_short
+        metrics["filtered_er001_short"] = er_001_metrics_short
 
-    # 심볼별 지표
+    # 롱+숏 결합 지표 (둘 다 있는 경우)
+    if "er_long" in models and "er_short" in models:
+        # 롱: er_long > 0.001, 숏: er_short > 0.001
+        combined_long = val_df[val_df["er_pred_long"] > 0.001]["ret_net_long"].fillna(0.0)
+        combined_short = val_df[val_df["er_pred_short"] > 0.001]["ret_net_short"].fillna(0.0)
+        combined_returns = pd.concat([combined_long, combined_short])
+        combined_metrics = _trade_metrics(combined_returns)
+        print(f"  Combined er>0.001: PF={combined_metrics['profit_factor']:.2f}, "
+              f"Expectancy={combined_metrics['expectancy']*100:.2f}%, "
+              f"Trades={int(combined_metrics['turnover']):,}")
+        metrics["filtered_combined"] = combined_metrics
+
+    # Meta-labeling 필터 (롱만)
+    if meta_model is not None and "er_long" in models:
+        X_val_meta = X_val.copy()
+        X_val_meta["primary_pred"] = val_df["er_pred_long"]
+        meta_proba = meta_model.predict_proba(X_val_meta)[:, 1]
+        val_df["meta_proba"] = meta_proba
+
+        # er_long > 0 + meta > threshold
+        filtered_meta = val_df[(val_df["er_pred_long"] > 0) & (val_df["meta_proba"] > cfg.meta_threshold)]
+        meta_metrics = _trade_metrics(filtered_meta["ret_net_long"].fillna(0.0))
+        print(f"  Long er>0 + meta>{cfg.meta_threshold}: PF={meta_metrics['profit_factor']:.2f}, "
+              f"Expectancy={meta_metrics['expectancy']*100:.2f}%, "
+              f"Trades={int(meta_metrics['turnover']):,}")
+
+        metrics["filtered_meta"] = meta_metrics
+
+    metrics["trade_long"] = base_metrics_long
+    metrics["trade_short"] = base_metrics_short
+    metrics["trade"] = base_metrics_long  # 호환성 유지
+
+    # 심볼별 지표 (롱 기준)
     print("\n[6/7] 심볼별 지표...")
     symbol_metrics: Dict[str, Any] = {}
     for symbol, group in val_df.groupby("symbol"):
         if group.empty:
             continue
-        sm = _trade_metrics(group["ret_net"].fillna(0.0))
+        sm = _trade_metrics(group["ret_net_long"].fillna(0.0))
         symbol_metrics[str(symbol)] = sm
         pf_str = f"{sm['profit_factor']:.2f}" if sm['profit_factor'] != float('inf') else "inf"
         print(f"  {symbol}: PF={pf_str}, Expectancy={sm['expectancy']*100:.2f}%")

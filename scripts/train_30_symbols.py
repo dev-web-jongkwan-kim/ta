@@ -72,14 +72,31 @@ def print_results(result: Dict[str, Any]) -> None:
     print(f"  Baseline:   PF={pf_str}, Expectancy={trade.get('expectancy', 0)*100:.2f}%, "
           f"Trades={int(trade.get('turnover', 0)):,}")
 
-    # 필터링된 지표
-    for name, key in [("er>0", "filtered_er0"), ("er>0.001", "filtered_er001"), ("er>0+meta", "filtered_meta")]:
+    # 필터링된 지표 (롱)
+    for name, key in [("Long er>0", "filtered_er0_long"), ("Long er>0.001", "filtered_er001_long"), ("Long+meta", "filtered_meta")]:
         m = metrics.get(key, {})
         if m:
             pf = m.get("profit_factor", 0)
             pf_str = f"{pf:.2f}" if pf != float("inf") else "inf"
-            print(f"  {name:<10}: PF={pf_str}, Expectancy={m.get('expectancy', 0)*100:.2f}%, "
+            print(f"  {name:<14}: PF={pf_str}, Expectancy={m.get('expectancy', 0)*100:.2f}%, "
                   f"Trades={int(m.get('turnover', 0)):,}")
+
+    # 필터링된 지표 (숏)
+    for name, key in [("Short er>0", "filtered_er0_short"), ("Short er>0.001", "filtered_er001_short")]:
+        m = metrics.get(key, {})
+        if m:
+            pf = m.get("profit_factor", 0)
+            pf_str = f"{pf:.2f}" if pf != float("inf") else "inf"
+            print(f"  {name:<14}: PF={pf_str}, Expectancy={m.get('expectancy', 0)*100:.2f}%, "
+                  f"Trades={int(m.get('turnover', 0)):,}")
+
+    # 결합 지표
+    combined = metrics.get("filtered_combined", {})
+    if combined:
+        pf = combined.get("profit_factor", 0)
+        pf_str = f"{pf:.2f}" if pf != float("inf") else "inf"
+        print(f"  {'Combined':<14}: PF={pf_str}, Expectancy={combined.get('expectancy', 0)*100:.2f}%, "
+              f"Trades={int(combined.get('turnover', 0)):,}")
 
     # 심볼별 지표
     by_symbol = metrics.get("by_symbol", {})
@@ -178,6 +195,12 @@ def main():
         action="store_true",
         help="CatBoost 앙상블 스킵",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=2,
+        help="병렬 학습 타겟 수 (기본값: 2)",
+    )
     args = parser.parse_args()
 
     # 심볼 목록
@@ -198,10 +221,11 @@ def main():
     print(f"\n학습 설정:")
     print(f"  - 학습 방식: 배치 (전체 데이터 한번에)")
     print(f"  - 멀티 타임프레임: Yes (1m, 15m, 1h)")
-    print(f"  - Optuna: {'No' if args.skip_optuna else f'Yes ({args.optuna_trials} trials × 4 targets)'}")
+    print(f"  - Optuna: {'No' if args.skip_optuna else f'Yes ({args.optuna_trials} trials × 8 targets)'}")
     print(f"  - Meta-labeling: {'No' if args.skip_meta else 'Yes'}")
     print(f"  - CatBoost 앙상블: {'No' if args.skip_catboost else 'Yes'}")
     print(f"  - Feature Selection: 누적 중요도 99.9%")
+    print(f"  - 병렬 학습: {args.parallel}개 동시")
 
     # 데이터 범위 확인
     min_ts, max_ts = get_data_range()
@@ -228,12 +252,14 @@ def main():
     # 학습 설정
     cfg = ImprovedTrainConfig(
         label_spec_hash=spec_hash,
-        feature_schema_version=3,
+        feature_schema_version=4,  # v4로 업데이트
         train_start=train_start.strftime("%Y-%m-%d"),
         train_end=train_end.strftime("%Y-%m-%d"),
         val_start=val_start.strftime("%Y-%m-%d"),
         val_end=val_end.strftime("%Y-%m-%d"),
-        targets=("er_long", "q05_long", "e_mae_long", "e_hold_long"),
+        # 롱 + 숏 모두 학습
+        targets=("er_long", "q05_long", "e_mae_long", "e_hold_long",
+                 "er_short", "q05_short", "e_mae_short", "e_hold_short"),
         use_multi_tf=True,  # 멀티 타임프레임 활성화
         use_optuna=not args.skip_optuna,
         optuna_trials=args.optuna_trials,
@@ -241,6 +267,7 @@ def main():
         feature_importance_threshold=0.001,  # 누적 중요도 99.9% 기준
         use_meta_labeling=not args.skip_meta,
         use_catboost_ensemble=not args.skip_catboost,
+        parallel_workers=args.parallel,  # 병렬 학습
     )
 
     # 학습 실행
