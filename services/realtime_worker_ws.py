@@ -35,6 +35,8 @@ from services.websocket.stream_router import StreamRouter
 from services.websocket.handlers.kline_handler import KlineHandler
 from services.websocket.handlers.mark_price_handler import MarkPriceHandler
 from services.websocket.handlers.book_ticker_handler import BookTickerHandler
+from services.engine.session_manager import session_manager
+from services.engine.position_manager import position_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -445,8 +447,15 @@ class RealtimeWorker:
 
         # Setup handlers
         self.kline_handler = KlineHandler(self.buffer, self.on_1m_candle_close)
-        self.mark_price_handler = MarkPriceHandler()
         self.book_ticker_handler = BookTickerHandler()
+        self.mark_price_handler = MarkPriceHandler(
+            position_manager=position_manager,
+            book_ticker_handler=self.book_ticker_handler,
+            session_manager=session_manager,
+        )
+
+        # Load positions from database on startup
+        position_manager.load_positions_from_db()
 
         # Register handlers
         self.router.register("kline_1m", self.kline_handler.handle_kline_1m)
