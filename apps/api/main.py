@@ -12,6 +12,7 @@ from packages.common.portfolio import get_portfolio_metrics
 from packages.common.runtime import get_collector_ok, get_mode, get_userstream_ok, set_mode
 from packages.common.types import StatusDTO
 from packages.common.ws_status import get_ws_status
+from services.engine.session_manager import session_manager
 
 app = FastAPI()
 app.add_middleware(
@@ -237,6 +238,85 @@ def risk_state() -> List[Dict[str, Any]]:
 def trading_toggle(mode: str) -> Dict[str, Any]:
     set_mode(mode)
     return {"status": "ok", "mode": mode}
+
+
+@app.post("/api/trading/start")
+def trading_start(mode: str = "shadow", initial_capital: Optional[float] = None) -> Dict[str, Any]:
+    """Start a new trading session.
+
+    Args:
+        mode: 'shadow' or 'live'
+        initial_capital: Optional starting capital amount
+    """
+    try:
+        session = session_manager.start(mode, initial_capital)
+        set_mode(mode)
+        return {
+            "status": "ok",
+            "mode": mode,
+            "session_id": str(session.session_id),
+            "started_at": session.started_at.isoformat(),
+        }
+    except RuntimeError as e:
+        return {"status": "error", "message": str(e)}
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/trading/stop")
+def trading_stop(final_capital: Optional[float] = None) -> Dict[str, Any]:
+    """Stop the current trading session.
+
+    Args:
+        final_capital: Optional final capital amount
+    """
+    try:
+        session = session_manager.stop(final_capital)
+        set_mode("off")
+        return {
+            "status": "ok",
+            "session_id": str(session.session_id),
+            "stopped_at": session.stopped_at.isoformat() if session.stopped_at else None,
+            "total_trades": session.total_trades,
+            "total_pnl": float(session.total_pnl),
+            "win_rate": session.win_rate,
+        }
+    except RuntimeError as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/trading/status")
+def trading_status() -> Dict[str, Any]:
+    """Get current trading status."""
+    return session_manager.get_status()
+
+
+@app.get("/api/trading/stats")
+def trading_stats(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get trading statistics for a session.
+
+    Args:
+        session_id: Optional session ID (defaults to current/latest session)
+    """
+    return session_manager.get_stats(session_id)
+
+
+@app.get("/api/trading/trades")
+def trading_trades(
+    session_id: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Get trade history with pagination.
+
+    Args:
+        session_id: Optional session ID filter
+        page: Page number (1-indexed)
+        limit: Items per page
+        symbol: Optional symbol filter
+    """
+    return session_manager.get_trades(session_id, page, limit, symbol)
 
 
 @app.post("/api/settings")
