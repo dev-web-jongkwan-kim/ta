@@ -37,6 +37,7 @@ from services.websocket.handlers.mark_price_handler import MarkPriceHandler
 from services.websocket.handlers.book_ticker_handler import BookTickerHandler
 from services.engine.session_manager import session_manager
 from services.engine.position_manager import position_manager
+from packages.common.runtime import get_mode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -293,10 +294,107 @@ class RealtimeWorker:
                 },
             )
 
-            logger.info(f"Inference complete: {symbol} -> {decision['decision']}")
+            logger.info(
+                f"[SIGNAL] {symbol} -> {decision['decision']} | "
+                f"er_long={preds.get('er_long', 0):.4f} er_short={preds.get('er_short', 0):.4f} | "
+                f"SL={sl_price:.2f} TP={tp_price:.2f}"
+            )
+
+            # Execute shadow trade if conditions met
+            await self._execute_shadow_trade(
+                symbol=symbol,
+                decision=decision,
+                signal_row=signal_row,
+                last_close=last_close,
+            )
 
         except Exception as e:
             logger.error(f"Inference failed for {symbol}: {e}", exc_info=True)
+
+    async def _execute_shadow_trade(
+        self,
+        symbol: str,
+        decision: Dict[str, Any],
+        signal_row: Dict[str, Any],
+        last_close: float,
+    ) -> None:
+        """
+        Execute shadow trade if conditions are met.
+
+        This registers the position with position_manager so SL/TP can be
+        monitored via markPrice stream. When SL/TP is hit, the position
+        is automatically closed and recorded.
+        """
+        # Only execute if trading session is active in shadow mode
+        if not session_manager.is_trading:
+            return
+
+        if session_manager.mode != "shadow":
+            return
+
+        # Only execute LONG or SHORT decisions
+        trade_decision = decision.get("decision", "HOLD")
+        if trade_decision not in ("LONG", "SHORT"):
+            return
+
+        # Check for block reasons
+        block_reasons = decision.get("block_reasons", [])
+        if block_reasons:
+            logger.debug(
+                f"[SHADOW] Trade blocked for {symbol}: {block_reasons}"
+            )
+            return
+
+        # Check if already have a position for this symbol
+        existing = position_manager.get_position(symbol)
+        if existing:
+            logger.debug(
+                f"[SHADOW] Already have position for {symbol}, skipping"
+            )
+            return
+
+        # Determine fill price
+        fill_price = last_close
+        if self.book_ticker_handler:
+            book = self.book_ticker_handler.get_latest_book(symbol)
+            if book:
+                # Use ask for LONG (buying), bid for SHORT (selling)
+                if trade_decision == "LONG":
+                    fill_price = book.get("ask", last_close)
+                else:
+                    fill_price = book.get("bid", last_close)
+
+        # Calculate position size (use notional from decision or default)
+        size_notional = decision.get("size_notional", 100.0)  # Default $100
+        qty = size_notional / fill_price if fill_price > 0 else 0
+
+        # Get SL/TP from signal
+        sl_price = signal_row.get("sl_price")
+        tp_price = signal_row.get("tp_price")
+        trade_group_id = signal_row.get("trade_group_id")
+
+        # Register position with position_manager
+        # This enables SL/TP monitoring via markPrice stream
+        position_manager.update_position_from_cache(
+            symbol=symbol,
+            side=trade_decision,
+            amt=qty if trade_decision == "LONG" else -qty,
+            entry_price=fill_price,
+            trade_group_id=str(trade_group_id) if trade_group_id else None,
+        )
+
+        # Override SL/TP with signal values (update_position_from_cache fetches from DB)
+        position = position_manager.get_position(symbol)
+        if position:
+            position.sl_price = sl_price
+            position.tp_price = tp_price
+
+        logger.info(
+            f"[SHADOW] Entered {trade_decision} {symbol} @ {fill_price:.4f} | "
+            f"qty={qty:.6f} notional=${size_notional:.2f} | "
+            f"SL={sl_price:.4f if sl_price else 'N/A'} "
+            f"TP={tp_price:.4f if tp_price else 'N/A'}"
+        )
 
     async def rest_poller(self) -> None:
         """Poll REST APIs for data not available via websocket."""
