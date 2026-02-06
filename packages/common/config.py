@@ -47,9 +47,14 @@ class Settings(BaseSettings):
     max_total_notional_pct: float = 1.2
     max_directional_notional_pct: float = 0.8
 
-    ev_min: float = 0.0
-    q05_min: float = -0.002
-    mae_max: float = 0.01
+    ev_min: float = 0.0015  # 0.15% minimum expected return (filters for higher quality trades)
+    q05_min: float = -0.002  # Original threshold
+    mae_max: float = 0.01   # Original threshold
+
+    # Trading settings
+    initial_capital: float = 300.0  # Initial seed capital
+    position_size: float = 30.0     # Fixed position size per trade
+    leverage: int = 10              # Leverage multiplier
 
     taker_fee_rate: float = 0.0004
     slippage_k: float = 0.15

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Optional
 
 from packages.common.symbol_map import to_internal
 from services.collector.buffer import IngestBuffer
@@ -18,6 +18,8 @@ class KlineHandler:
         self,
         buffer: IngestBuffer,
         on_candle_close: Callable[[str, datetime], None] | None = None,
+        on_candle_close_15m: Callable[[str, datetime], None] | None = None,
+        on_candle_close_1h: Callable[[str, datetime], None] | None = None,
     ):
         """
         Initialize kline handler.
@@ -25,10 +27,16 @@ class KlineHandler:
         Args:
             buffer: Ingest buffer for storing candles
             on_candle_close: Callback for 1m candle completion (symbol, close_time)
+            on_candle_close_15m: Callback for 15m candle completion
+            on_candle_close_1h: Callback for 1h candle completion
         """
         self.buffer = buffer
         self.on_candle_close = on_candle_close
+        self.on_candle_close_15m = on_candle_close_15m
+        self.on_candle_close_1h = on_candle_close_1h
         self.last_1m_close: dict[str, datetime] = {}
+        self.last_15m_close: dict[str, datetime] = {}
+        self.last_1h_close: dict[str, datetime] = {}
 
     def handle_kline_1m(self, data: dict) -> None:
         """
@@ -94,7 +102,7 @@ class KlineHandler:
         """
         Handle 15m kline message.
 
-        Only updates cache, no inference trigger.
+        Stores candle and triggers feature computation.
         """
         k = data.get("k", {})
         symbol = to_internal(data.get("s", ""), "ws")
@@ -105,6 +113,12 @@ class KlineHandler:
 
         close_time_ms = k.get("T", 0)
         close_time = datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc)
+
+        # Deduplicate
+        if self.last_15m_close.get(symbol) == close_time:
+            return
+
+        self.last_15m_close[symbol] = close_time
 
         try:
             self.buffer.add_candle_15m(
@@ -118,10 +132,12 @@ class KlineHandler:
                     float(k.get("v", 0)),
                 )
             )
-            logger.debug(f"15m candle closed: {symbol} @ {close_time}")
-        except AttributeError:
-            # Buffer might not have add_candle_15m yet - we'll add it
-            logger.debug("15m candle buffer method not implemented yet")
+            logger.info(f"15m candle closed: {symbol} @ {close_time}")
+
+            # Trigger feature computation callback
+            if self.on_candle_close_15m:
+                self.on_candle_close_15m(symbol, close_time)
+
         except Exception as e:
             logger.error(f"Failed to process 15m kline for {symbol}: {e}")
 
@@ -129,7 +145,7 @@ class KlineHandler:
         """
         Handle 1h kline message.
 
-        Only updates cache, no inference trigger.
+        Stores candle and triggers feature computation.
         """
         k = data.get("k", {})
         symbol = to_internal(data.get("s", ""), "ws")
@@ -140,6 +156,12 @@ class KlineHandler:
 
         close_time_ms = k.get("T", 0)
         close_time = datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc)
+
+        # Deduplicate
+        if self.last_1h_close.get(symbol) == close_time:
+            return
+
+        self.last_1h_close[symbol] = close_time
 
         try:
             self.buffer.add_candle_1h(
@@ -153,9 +175,11 @@ class KlineHandler:
                     float(k.get("v", 0)),
                 )
             )
-            logger.debug(f"1h candle closed: {symbol} @ {close_time}")
-        except AttributeError:
-            # Buffer might not have add_candle_1h yet - we'll add it
-            logger.debug("1h candle buffer method not implemented yet")
+            logger.info(f"1h candle closed: {symbol} @ {close_time}")
+
+            # Trigger feature computation callback
+            if self.on_candle_close_1h:
+                self.on_candle_close_1h(symbol, close_time)
+
         except Exception as e:
             logger.error(f"Failed to process 1h kline for {symbol}: {e}")

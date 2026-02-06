@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, TYPE_CHECKING
 
 from packages.common.symbol_map import to_internal
+from packages.common.bus import RedisBus
 
 if TYPE_CHECKING:
     from services.websocket.handlers.book_ticker_handler import BookTickerHandler
@@ -36,6 +37,7 @@ class MarkPriceHandler:
         self._position_manager = position_manager
         self._book_ticker_handler = book_ticker_handler
         self._session_manager = session_manager
+        self._bus = RedisBus()
 
         # Callback for SL/TP hits
         self._on_sl_tp_hit_callbacks: list[Callable] = []
@@ -101,10 +103,13 @@ class MarkPriceHandler:
         If SL or TP is hit, triggers position close.
         """
         if not self._position_manager:
+            logger.debug(f"[SLTP] No position manager for {symbol}")
             return
 
         # Check if SL/TP hit
         result = self._position_manager.check_sl_tp(symbol, mark_price)
+        if result:
+            logger.info(f"[SLTP] Result for {symbol}: {result}")
         if not result:
             return
 
@@ -174,6 +179,26 @@ class MarkPriceHandler:
         logger.info(
             f"{'[SHADOW] ' if is_shadow else ''}Position closed by {exit_reason}: "
             f"{symbol} PnL={trade_record['pnl']:.2f}"
+        )
+
+        # Publish position closed event for real-time UI updates
+        self._bus.publish_json(
+            "trading_events",
+            {
+                "type": "position_closed",
+                "symbol": symbol,
+                "side": trade_record["side"],
+                "exit_reason": exit_reason,
+                "entry_price": trade_record["entry_price"],
+                "exit_price": fill_price,
+                "entry_time": trade_record["entry_time"].isoformat(),
+                "exit_time": trade_record["exit_time"].isoformat(),
+                "qty": trade_record["qty"],
+                "pnl": trade_record["pnl"],
+                "return_pct": trade_record.get("return_pct", 0),
+                "hold_min": trade_record.get("hold_min", 0),
+                "is_shadow": is_shadow,
+            },
         )
 
     def get_latest_price(self, symbol: str) -> dict | None:

@@ -5,8 +5,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from packages.common.bus import RedisBus
+from packages.common.config import get_settings
+from services.engine.position_manager import position_manager
 from packages.common.db import execute, fetch_all
 from packages.common.portfolio import get_portfolio_metrics
 from packages.common.runtime import get_collector_ok, get_mode, get_userstream_ok, set_mode
@@ -193,6 +196,27 @@ def models() -> List[Dict[str, Any]]:
     return [dict(zip(columns, r)) for r in rows]
 
 
+@app.get("/api/models/production")
+def models_production() -> Dict[str, Any]:
+    """Get current production model with metrics"""
+    rows = fetch_all("SELECT * FROM models WHERE is_production = true LIMIT 1")
+    if not rows:
+        return {}
+    columns = [
+        "model_id",
+        "created_at",
+        "algo",
+        "feature_schema_version",
+        "label_spec_hash",
+        "train_start",
+        "train_end",
+        "metrics",
+        "artifact_uri",
+        "is_production",
+    ]
+    return dict(zip(columns, rows[0]))
+
+
 @app.get("/api/models/{model_id}")
 def model(model_id: str) -> Dict[str, Any]:
     rows = fetch_all("SELECT * FROM models WHERE model_id=%s", (model_id,))
@@ -319,6 +343,75 @@ def trading_trades(
     return session_manager.get_trades(session_id, page, limit, symbol)
 
 
+@app.get("/api/trading/positions")
+def trading_positions() -> Dict[str, Any]:
+    """Get current open positions from position manager.
+
+    Returns positions being monitored for SL/TP.
+    """
+    positions = position_manager.get_all_positions()
+    result = []
+    for symbol, pos in positions.items():
+        result.append({
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "qty": pos.amt,
+            "entry_price": pos.entry_price,
+            "entry_time": pos.entry_time.isoformat(),
+            "sl_price": pos.sl_price,
+            "tp_price": pos.tp_price,
+            "trade_group_id": str(pos.trade_group_id) if pos.trade_group_id else None,
+        })
+    return {"positions": result, "count": len(result)}
+
+
+@app.get("/api/trading/stream")
+async def trading_stream():
+    """SSE endpoint for real-time trading updates.
+
+    Events:
+    - position_opened: New position entered
+    - position_closed: Position closed (SL/TP/Manual)
+    - stats_update: Session stats updated
+    """
+    import asyncio
+    from starlette.concurrency import run_in_threadpool
+
+    async def event_generator():
+        bus = RedisBus()
+        last_id = "$"  # Only new messages
+
+        while True:
+            try:
+                # Read from trading_events stream - run in threadpool to avoid blocking event loop
+                entries = await run_in_threadpool(
+                    bus.read, "trading_events", last_id, 10, 1000
+                )
+                for entry_id, fields in entries:
+                    last_id = entry_id
+                    data = fields.get("data")
+                    if data:
+                        yield f"data: {data}\n\n"
+
+                # Heartbeat every 15 seconds to keep connection alive
+                yield f": heartbeat\n\n"
+                await asyncio.sleep(0.1)
+
+            except Exception as e:
+                yield f"data: {{\"type\": \"error\", \"message\": \"{str(e)}\"}}\n\n"
+                await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 @app.post("/api/settings")
 def settings_update(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "payload": payload}
@@ -326,15 +419,20 @@ def settings_update(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/api/settings")
 def settings_get() -> Dict[str, Any]:
-    """Get current settings including filter thresholds"""
-    # Default thresholds - could be stored in DB in future
+    """Get current settings from config"""
+    settings = get_settings()
     return {
-        "ev_min": 0.0,
-        "q05_min": -0.002,
-        "mae_max": 0.01,
-        "max_positions": 5,
-        "daily_loss_limit": 0.02,
+        "ev_min": settings.ev_min,
+        "q05_min": settings.q05_min,
+        "mae_max": settings.mae_max,
+        "max_positions": settings.max_positions,
+        "daily_loss_limit": settings.daily_loss_limit_pct,
+        "leverage": settings.leverage,
+        "position_size": settings.position_size,
+        "initial_capital": settings.initial_capital,
     }
+
+
 
 
 # RL API Endpoints
@@ -470,11 +568,16 @@ def rl_decisions_stats(symbol: Optional[str] = None, hours: int = 24) -> Dict[st
 
 @app.websocket("/ws/{channel}")
 async def ws_channel(ws: WebSocket, channel: str) -> None:
+    from starlette.concurrency import run_in_threadpool
+
     await ws.accept()
     bus = RedisBus()
     last_id = "0-0"
     while True:
-        entries = bus.read(channel, last_id=last_id, count=100, block_ms=1000)
+        # Run blocking Redis call in threadpool to avoid blocking event loop
+        entries = await run_in_threadpool(
+            bus.read, channel, last_id, 100, 1000
+        )
         for entry_id, fields in entries:
             last_id = entry_id
             data = fields.get("data")

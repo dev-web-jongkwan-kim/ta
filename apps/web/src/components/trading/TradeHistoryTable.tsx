@@ -31,43 +31,71 @@ interface TradesResponse {
 interface TradeHistoryTableProps {
   sessionId?: string;
   symbol?: string;
-  refreshInterval?: number;
 }
 
 export default function TradeHistoryTable({
   sessionId,
   symbol,
-  refreshInterval = 5000
 }: TradeHistoryTableProps) {
   const [data, setData] = useState<TradesResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
+  const [flashTradeId, setFlashTradeId] = useState<string | null>(null);
   const limit = 20;
 
-  useEffect(() => {
-    const fetchTrades = async () => {
-      try {
-        const params = new URLSearchParams({
-          page: page.toString(),
-          limit: limit.toString(),
-        });
-        if (sessionId) params.append("session_id", sessionId);
-        if (symbol) params.append("symbol", symbol);
+  const fetchTrades = async () => {
+    try {
+      const params = new URLSearchParams({
+        page: page.toString(),
+        limit: limit.toString(),
+      });
+      if (sessionId) params.append("session_id", sessionId);
+      if (symbol) params.append("symbol", symbol);
 
-        const res = await fetch(`/api/trading/trades?${params}`);
-        const json = await res.json();
-        setData(json);
-      } catch (error) {
-        console.error("Failed to fetch trades:", error);
-      } finally {
-        setLoading(false);
+      const res = await fetch(`/api/trading/trades?${params}`);
+      const json = await res.json();
+      setData(json);
+    } catch (error) {
+      console.error("Failed to fetch trades:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Initial fetch
+  useEffect(() => {
+    fetchTrades();
+  }, [sessionId, symbol, page]);
+
+  // SSE for real-time updates
+  useEffect(() => {
+    const eventSource = new EventSource("/api/trading/stream");
+
+    eventSource.onmessage = (event) => {
+      try {
+        const eventData = JSON.parse(event.data);
+
+        if (eventData.type === "position_closed") {
+          // Refetch trades to get the new trade
+          fetchTrades();
+
+          // Flash animation for new trade
+          setTimeout(() => {
+            if (data?.trades?.[0]) {
+              setFlashTradeId(data.trades[0].trade_id);
+              setTimeout(() => setFlashTradeId(null), 500);
+            }
+          }, 100);
+        }
+      } catch {
+        // Ignore parse errors (heartbeats)
       }
     };
 
-    fetchTrades();
-    const interval = setInterval(fetchTrades, refreshInterval);
-    return () => clearInterval(interval);
-  }, [sessionId, symbol, page, refreshInterval]);
+    return () => {
+      eventSource.close();
+    };
+  }, [sessionId, symbol, page]);
 
   const formatTime = (isoString: string): string => {
     const date = new Date(isoString);
@@ -177,7 +205,10 @@ export default function TradeHistoryTable({
               </tr>
             ) : (
               data?.trades.map((trade) => (
-                <tr key={trade.trade_id} className="table-row">
+                <tr
+                  key={trade.trade_id}
+                  className={`table-row ${flashTradeId === trade.trade_id ? "flash-update" : ""}`}
+                >
                   <td className="table-cell font-mono text-sm">
                     {trade.symbol}
                     {trade.is_shadow && (

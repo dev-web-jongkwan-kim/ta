@@ -1,7 +1,7 @@
 """
-15분봉 + 멀티타임프레임 모델 훈련
-- 기준: 15분봉
-- 추가 피처: 1분봉, 1시간봉
+1분봉 라벨 + 15m ATR + 멀티타임프레임 피처 모델 훈련
+- 라벨: 1m (15m ATR 기반 TP/SL)
+- 피처: 1m + 15m + 1h
 - 방향: 롱 + 숏 양방향
 """
 from __future__ import annotations
@@ -14,31 +14,36 @@ from services.training.train import TrainConfig, run_training_job
 
 
 def get_available_data_range():
-    """15분봉 학습 가능한 데이터 범위 확인"""
+    """1분봉 학습 가능한 데이터 범위 확인"""
     rows = fetch_all("""
         SELECT
             MIN(f.ts) as min_ts,
             MAX(f.ts) as max_ts,
             COUNT(*) as total_rows
-        FROM features_15m f
-        JOIN labels_long_15m ll ON f.symbol = ll.symbol AND f.ts = ll.ts
-        JOIN labels_short_15m ls ON f.symbol = ls.symbol AND f.ts = ls.ts
+        FROM features_1m f
+        JOIN labels_long_1m ll ON f.symbol = ll.symbol AND f.ts = ll.ts
+        JOIN labels_short_1m ls ON f.symbol = ls.symbol AND f.ts = ls.ts
         WHERE f.schema_version = 4
-        AND ll.spec_hash = ls.spec_hash
+        AND ll.spec_hash = '8c8d570e2343c185'
+        AND ls.spec_hash = '8c8d570e2343c185'
     """)
     return rows[0] if rows else None
 
 
 def main() -> None:
-    print("=== 15분봉 멀티타임프레임 모델 훈련 ===")
+    print("=" * 60)
+    print("1분봉 + 15m ATR + 멀티타임프레임 피처 모델 훈련")
+    print("=" * 60)
 
     # 데이터 범위 확인
     data_range = get_available_data_range()
     if data_range and data_range[0]:
         print(f"사용 가능 데이터: {data_range[0]} ~ {data_range[1]} ({data_range[2]:,}개)")
+    else:
+        print("경고: 데이터가 없습니다!")
+        sys.exit(1)
 
     # 동적 날짜 설정
-    # val_end: 어제 (오늘 데이터는 라벨 생성 불가)
     today = datetime.now(timezone.utc).date()
     yesterday = today - timedelta(days=1)
 
@@ -53,7 +58,7 @@ def main() -> None:
     print(f"Val: {val_start.date()} ~ {val_end.date()}")
 
     cfg = TrainConfig(
-        label_spec_hash='edd425ea68ae74cb',  # 15분봉 라벨
+        label_spec_hash='8c8d570e2343c185',  # 1m 라벨 (15m ATR 기반)
         feature_schema_version=4,
         train_start=train_start.strftime('%Y-%m-%d'),
         train_end=train_end.strftime('%Y-%m-%d'),
@@ -64,25 +69,37 @@ def main() -> None:
             'er_short', 'q05_short', 'e_mae_short', 'e_hold_short',
         ),
         algo='lgbm',
-        timeframe='15m',  # 15분봉 기준
-        use_multi_tf=True,  # 1분봉 + 1시간봉 피처 추가 사용
+        timeframe='1m',  # 1분봉 기준
+        use_multi_tf=True,  # 15분봉 + 1시간봉 피처 추가
         label_spec={
             'k_tp': 1.5,
             'k_sl': 1.0,
-            'h_bars': 24,  # 15분 × 24 = 6시간
+            'h_bars': 360,  # 6시간
             'fee_rate': 0.0004,
-            'slippage_k': 0.15
+            'slippage_k': 0.15,
+            'atr_timeframe': '15m',  # 15m ATR 사용
         }
     )
 
+    print()
+    print("Config:")
+    print(f"  label_spec_hash: {cfg.label_spec_hash}")
+    print(f"  timeframe: {cfg.timeframe}")
+    print(f"  use_multi_tf: {cfg.use_multi_tf}")
+    print(f"  targets: {cfg.targets}")
+    print()
     print("훈련 중...")
+
     result = run_training_job(cfg)
 
     if result.get('status') == 'empty':
         print(f"실패: {result.get('message')}")
         sys.exit(1)
 
-    print("=== 훈련 완료 ===")
+    print()
+    print("=" * 60)
+    print("훈련 완료")
+    print("=" * 60)
     print(f"Model ID: {result.get('model_id')}")
     print()
 

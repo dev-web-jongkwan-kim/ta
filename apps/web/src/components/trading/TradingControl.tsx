@@ -28,7 +28,7 @@ export default function TradingControl({ compact = false, onStatusChange }: Trad
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch current status on mount and periodically
+  // Fetch current status on mount
   useEffect(() => {
     const fetchStatus = async () => {
       try {
@@ -42,9 +42,38 @@ export default function TradingControl({ compact = false, onStatusChange }: Trad
     };
 
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
-    return () => clearInterval(interval);
   }, [onStatusChange]);
+
+  // SSE for real-time updates
+  useEffect(() => {
+    if (!status.is_running) return;
+
+    const eventSource = new EventSource("/api/trading/stream");
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        // Update stats on position events
+        if (data.type === "position_closed") {
+          // Refetch status to get updated stats
+          fetch("/api/trading/status")
+            .then((res) => res.json())
+            .then((newStatus) => {
+              setStatus(newStatus);
+              onStatusChange?.(newStatus);
+            })
+            .catch(console.error);
+        }
+      } catch {
+        // Ignore parse errors (heartbeats)
+      }
+    };
+
+    return () => {
+      eventSource.close();
+    };
+  }, [status.is_running, onStatusChange]);
 
   const handleStart = async (newMode: "shadow" | "live") => {
     if (status.is_running && status.mode === newMode) {

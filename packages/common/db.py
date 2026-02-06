@@ -51,6 +51,13 @@ def fetch_all(query: str, params: Tuple | None = None) -> List[Tuple]:
             return cur.fetchall()
 
 
+def fetch_one(query: str, params: Tuple | None = None) -> Tuple | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params or ())
+            return cur.fetchone()
+
+
 def execute(query: str, params: Tuple | None = None) -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:

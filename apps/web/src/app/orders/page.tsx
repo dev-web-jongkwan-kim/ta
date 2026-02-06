@@ -2,6 +2,8 @@ import OrdersTable from "@/components/tables/OrdersTable";
 import TradingControl from "@/components/trading/TradingControl";
 import TradingSummary from "@/components/trading/TradingSummary";
 import TradeHistoryTable from "@/components/trading/TradeHistoryTable";
+import OpenPositions from "@/components/trading/OpenPositions";
+import ModelInfoCard from "@/components/trading/ModelInfoCard";
 
 export default function OrdersPage() {
   return (
@@ -11,10 +13,16 @@ export default function OrdersPage() {
       {/* Trading Control */}
       <TradingControl />
 
+      {/* Production Model Info */}
+      <ModelInfoCard />
+
       {/* Trading Summary */}
       <TradingSummary />
 
-      {/* Trade History */}
+      {/* Open Positions - Real-time via SSE */}
+      <OpenPositions />
+
+      {/* Closed Trades History */}
       <TradeHistoryTable />
 
       {/* Orders Table */}

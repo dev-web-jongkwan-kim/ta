@@ -6,6 +6,7 @@ import TopSignalsTable, { SignalRow } from "@/components/cards/TopSignalsTable";
 
 type SignalDTO = {
   symbol: string;
+  ts: string;
   decision: string;
   ev_long?: number;
   ev_short?: number;
@@ -28,6 +29,8 @@ export default function SignalsPage() {
   const [signals, setSignals] = useState<SignalRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<FilterType>("all");
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [signalTime, setSignalTime] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchSignals = async () => {
@@ -36,6 +39,10 @@ export default function SignalsPage() {
         const res = await fetch(`${apiBase}/api/signals/latest?limit=50`);
         if (!res.ok) throw new Error("Failed to fetch");
         const data: SignalDTO[] = await res.json();
+
+        if (data.length > 0 && data[0].ts) {
+          setSignalTime(data[0].ts);
+        }
 
         const rows = data.map((signal) => {
           const blockReasons = parseBlockReasons(signal.block_reason_codes);
@@ -51,6 +58,7 @@ export default function SignalsPage() {
         });
 
         setSignals(rows);
+        setLastUpdated(new Date());
       } catch (e) {
         console.error("Failed to fetch signals:", e);
         setSignals([]);
@@ -70,12 +78,37 @@ export default function SignalsPage() {
     return true;
   });
 
+  const formatSignalTime = (ts: string) => {
+    const date = new Date(ts);
+    return date.toLocaleString("ko-KR", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-display font-semibold text-foreground">Signals</h1>
-          <p className="text-sm text-foreground-muted">Filter by EV, funding extremes, or blocked actions.</p>
+          <p className="text-sm text-foreground-muted">
+            15분봉 종가 시점에 모델이 예측한 EV와 거래 결정을 표시합니다.
+          </p>
+          <div className="flex items-center gap-4 mt-1 text-xs text-foreground-muted">
+            {signalTime && (
+              <span>
+                Signal Time: <span className="font-mono">{formatSignalTime(signalTime)}</span>
+              </span>
+            )}
+            {lastUpdated && (
+              <span>
+                Updated: <span className="font-mono">{lastUpdated.toLocaleTimeString()}</span>
+                <span className="ml-1">(10s)</span>
+              </span>
+            )}
+          </div>
         </div>
         <div className="flex gap-2">
           <button

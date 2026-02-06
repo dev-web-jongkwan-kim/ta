@@ -14,19 +14,42 @@ interface RiskEvent {
   details: any;
 }
 
+interface Settings {
+  max_positions: number;
+  daily_loss_limit: number;
+  leverage: number;
+  position_size: number;
+  initial_capital: number;
+  ev_min: number;
+  q05_min: number;
+  mae_max: number;
+}
+
 export default function RiskPage() {
   const [events, setEvents] = useState<RiskEvent[]>([]);
+  const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
       try {
         const apiBase = getClientApiBase();
-        const res = await fetch(`${apiBase}/api/risk/state`);
-        if (!res.ok) throw new Error("Failed to fetch risk state");
-        const data: RiskEvent[] = await res.json();
-        setEvents(data);
+        const [eventsRes, settingsRes] = await Promise.all([
+          fetch(`${apiBase}/api/risk/state`),
+          fetch(`${apiBase}/api/settings`),
+        ]);
+
+        if (!eventsRes.ok) throw new Error("Failed to fetch risk state");
+        if (!settingsRes.ok) throw new Error("Failed to fetch settings");
+
+        const eventsData: RiskEvent[] = await eventsRes.json();
+        const settingsData: Settings = await settingsRes.json();
+
+        setEvents(eventsData);
+        setSettings(settingsData);
+        setLastUpdated(new Date());
       } catch (e) {
         console.error("Failed to load risk state:", e);
         setError(e instanceof Error ? e.message : "Unknown error");
@@ -69,6 +92,14 @@ export default function RiskPage() {
 
   return (
     <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-display font-semibold text-foreground">Risk Management</h1>
+        <p className="text-sm text-foreground-muted mt-1">
+          리스크 이벤트 모니터링 및 거래 제한 설정을 관리합니다.
+        </p>
+      </div>
+
       {loading ? (
         <div className="card p-6">
           <div className="space-y-3">
@@ -128,29 +159,74 @@ export default function RiskPage() {
 
           {/* Risk Settings */}
           <div className="card p-5">
-            <h3 className="font-display font-semibold text-foreground mb-4">Risk Settings</h3>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-display font-semibold text-foreground">Risk Settings</h3>
+              {lastUpdated && (
+                <span className="text-xs text-foreground-muted">
+                  Updated: {lastUpdated.toLocaleTimeString()} (30s interval)
+                </span>
+              )}
+            </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <div className="bg-background-tertiary/50 rounded-lg p-3">
                 <div className="flex items-center text-foreground-muted text-xs">
                   Max Positions <InfoTooltip term="MAX_POSITIONS" />
                 </div>
-                <div className="font-mono text-lg font-semibold text-foreground mt-1">5</div>
+                <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                  {settings?.max_positions ?? "-"}
+                </div>
               </div>
               <div className="bg-background-tertiary/50 rounded-lg p-3">
                 <div className="flex items-center text-foreground-muted text-xs">
                   Daily Loss Limit <InfoTooltip term="DAILY_LOSS" />
                 </div>
-                <div className="font-mono text-lg font-semibold text-foreground mt-1">2%</div>
+                <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                  {settings?.daily_loss_limit ? `${(settings.daily_loss_limit * 100).toFixed(0)}%` : "-"}
+                </div>
               </div>
               <div className="bg-background-tertiary/50 rounded-lg p-3">
                 <div className="text-foreground-muted text-xs">Leverage</div>
-                <div className="font-mono text-lg font-semibold text-foreground mt-1">3x</div>
+                <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                  {settings?.leverage ? `${settings.leverage}x` : "-"}
+                </div>
               </div>
               <div className="bg-background-tertiary/50 rounded-lg p-3">
                 <div className="text-foreground-muted text-xs">Position Size</div>
-                <div className="font-mono text-lg font-semibold text-foreground mt-1">5%</div>
+                <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                  {settings?.position_size ? `$${settings.position_size}` : "-"}
+                </div>
               </div>
             </div>
+
+            {/* Additional Settings */}
+            {settings && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
+                <div className="bg-background-tertiary/50 rounded-lg p-3">
+                  <div className="text-foreground-muted text-xs">Initial Capital</div>
+                  <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                    ${settings.initial_capital}
+                  </div>
+                </div>
+                <div className="bg-background-tertiary/50 rounded-lg p-3">
+                  <div className="text-foreground-muted text-xs">EV Min</div>
+                  <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                    {(settings.ev_min * 100).toFixed(2)}%
+                  </div>
+                </div>
+                <div className="bg-background-tertiary/50 rounded-lg p-3">
+                  <div className="text-foreground-muted text-xs">Q05 Min</div>
+                  <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                    {(settings.q05_min * 100).toFixed(2)}%
+                  </div>
+                </div>
+                <div className="bg-background-tertiary/50 rounded-lg p-3">
+                  <div className="text-foreground-muted text-xs">MAE Max</div>
+                  <div className="font-mono text-lg font-semibold text-foreground mt-1">
+                    {(settings.mae_max * 100).toFixed(2)}%
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </>
       )}

@@ -18,6 +18,7 @@ export default function DataQualityPage() {
   const [metrics, setMetrics] = useState<DriftMetric[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -36,6 +37,7 @@ export default function DataQualityPage() {
         }
 
         setMetrics(Array.from(latestBySymbol.values()));
+        setLastUpdated(new Date());
       } catch (e) {
         console.error("Failed to load data quality:", e);
         setError(e instanceof Error ? e.message : "Unknown error");
@@ -59,6 +61,20 @@ export default function DataQualityPage() {
 
   return (
     <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-display font-semibold text-foreground">Data Quality</h1>
+        <p className="text-sm text-foreground-muted mt-1">
+          피처 데이터의 분포 변화(PSI), 결측률, 지연시간을 모니터링합니다.
+        </p>
+        {lastUpdated && (
+          <p className="text-xs text-foreground-muted mt-1">
+            Updated: <span className="font-mono">{lastUpdated.toLocaleTimeString()}</span>
+            <span className="ml-1">(30s interval)</span>
+          </p>
+        )}
+      </div>
+
       {loading ? (
         <div className="card p-6">
           <div className="space-y-3">
@@ -76,7 +92,7 @@ export default function DataQualityPage() {
       ) : cardMetrics.length === 0 ? (
         <div className="card p-6">
           <div className="text-center text-foreground-muted py-8">
-            No drift metrics recorded yet.
+            No drift metrics recorded yet. Drift metrics are generated during feature calculation.
           </div>
         </div>
       ) : (

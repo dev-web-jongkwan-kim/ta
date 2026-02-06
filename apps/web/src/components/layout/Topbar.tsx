@@ -2,7 +2,7 @@
 
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getClientApiBase } from "@/lib/client-api";
+import { useWebSocketStatus } from "@/contexts/WebSocketStatusContext";
 
 const pageInfo: Record<string, { title: string; subtitle: string }> = {
   "/dashboard": { title: "Dashboard", subtitle: "System overview and key metrics" },
@@ -15,41 +15,12 @@ const pageInfo: Record<string, { title: string; subtitle: string }> = {
   "/settings": { title: "Settings", subtitle: "System configuration" },
 };
 
-interface WebsocketStatus {
-  connected: boolean;
-  uptime_sec: number;
-  last_message_ago_sec: number | null;
-  reconnect_count: number;
-  streams_active: number;
-  streams_total: number;
-  total_messages: number;
-}
-
 export default function Topbar() {
   const pathname = usePathname();
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
-  const [wsStatus, setWsStatus] = useState<WebsocketStatus | null>(null);
+  const { status: wsStatus } = useWebSocketStatus();
 
   const info = pageInfo[pathname] || { title: "TA Ops", subtitle: "Trading system" };
-
-  useEffect(() => {
-    const fetchWsStatus = async () => {
-      try {
-        const apiBase = getClientApiBase();
-        const res = await fetch(`${apiBase}/api/websocket/status`);
-        if (res.ok) {
-          const data = await res.json();
-          setWsStatus(data);
-        }
-      } catch (e) {
-        console.error("Failed to fetch WS status:", e);
-      }
-    };
-
-    fetchWsStatus();
-    const interval = setInterval(fetchWsStatus, 2000); // Poll every 2 seconds
-    return () => clearInterval(interval);
-  }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {

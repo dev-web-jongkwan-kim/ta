@@ -49,7 +49,7 @@ export default function SettingsPage() {
             <input
               type="text"
               className="input"
-              defaultValue="http://localhost:8000"
+              defaultValue="http://localhost:7101"
               disabled
             />
           </div>

@@ -3,6 +3,7 @@ version: "3.9"
 services:
   postgres:
     image: postgres:16
+    shm_size: '2gb'
     environment:
       POSTGRES_DB: ta
       POSTGRES_USER: ta
@@ -31,15 +32,19 @@ services:
 
   api:
     build: .
-    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 7101
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://ta:ta@postgres:5432/ta
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
     depends_on:
       - postgres
       - redis
       - minio
     ports:
-      - "8000:8000"
+      - "7101:7101"
     deploy:
       resources:
         limits:
@@ -49,9 +54,13 @@ services:
 
   worker_realtime:
     build: .
-    command: python -m services.realtime_worker
+    command: python -m services.realtime_worker_ws
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://ta:ta@postgres:5432/ta
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
     depends_on:
       - postgres
       - redis
@@ -62,6 +71,10 @@ services:
     command: python -m services.batch_worker
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://ta:ta@postgres:5432/ta
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
     depends_on:
       - postgres
       - redis
@@ -69,10 +82,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 12G
+          memory: 28G
         reservations:
-          memory: 4G
-    shm_size: '4gb'
+          memory: 8G
+    shm_size: '8gb'
 
   # worker_universe 비활성화 (고정 유니버스 사용)
   # worker_universe:
@@ -90,11 +103,11 @@ services:
     env_file:
       - .env
     ports:
-      - "3000:3000"
+      - "7100:7000"
     depends_on:
       - api
     environment:
-      - NEXT_PUBLIC_API_BASE=http://api:8000
+      - NEXT_PUBLIC_API_BASE=http://api:7101
 
 volumes:
   pgdata:

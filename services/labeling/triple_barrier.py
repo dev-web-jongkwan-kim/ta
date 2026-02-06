@@ -16,9 +16,10 @@ class LabelSpec:
     risk_mae_atr: float
     fee_rate: float
     slippage_k: float
+    atr_timeframe: str = ""  # ATR 계산용 타임프레임 (예: "15m"). 빈 문자열이면 라벨 타임프레임과 동일
 
     def hash(self) -> str:
-        payload = f"{self.k_tp}-{self.k_sl}-{self.h_bars}-{self.risk_mae_atr}-{self.fee_rate}-{self.slippage_k}"
+        payload = f"{self.k_tp}-{self.k_sl}-{self.h_bars}-{self.risk_mae_atr}-{self.fee_rate}-{self.slippage_k}-{self.atr_timeframe}"
         return sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 

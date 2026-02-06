@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Literal
 from uuid import UUID, uuid4
@@ -42,8 +42,14 @@ class TradingSession:
 
     @property
     def running_time_sec(self) -> int:
-        end = self.stopped_at or datetime.utcnow()
-        return int((end - self.started_at).total_seconds())
+        from datetime import timezone
+        end = self.stopped_at or datetime.now(timezone.utc)
+        # Handle both naive and aware datetimes
+        if self.started_at.tzinfo is None:
+            started = self.started_at.replace(tzinfo=timezone.utc)
+        else:
+            started = self.started_at
+        return int((end - started).total_seconds())
 
     def to_dict(self) -> Dict:
         return {
@@ -114,18 +120,76 @@ class TradingSessionManager:
     _instance: Optional["TradingSessionManager"] = None
     _current_session: Optional[TradingSession] = None
     _mode: TradingMode = "off"
+    _last_check: Optional[datetime] = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    def _sync_from_db(self) -> None:
+        """Sync state from database (for cross-container consistency)."""
+        now = datetime.now(timezone.utc)
+        # Only check every 5 seconds to avoid hammering DB
+        if self._last_check and (now - self._last_check).total_seconds() < 5:
+            return
+        self._last_check = now
+
+        try:
+            rows = fetch_all(
+                """
+                SELECT session_id, mode, started_at, initial_capital
+                FROM trading_sessions
+                WHERE stopped_at IS NULL
+                ORDER BY started_at DESC
+                LIMIT 1
+                """
+            )
+            if rows:
+                row = rows[0]
+                session_id = UUID(row[0]) if isinstance(row[0], str) else row[0]
+                mode = row[1]
+                started_at = row[2]
+                initial_capital = row[3]
+
+                if self._current_session is None or self._current_session.session_id != session_id:
+                    self._current_session = TradingSession(
+                        session_id=session_id,
+                        mode=mode,
+                        started_at=started_at,
+                        stopped_at=None,
+                        initial_capital=Decimal(str(initial_capital)) if initial_capital else None,
+                        final_capital=None,
+                        total_trades=0,
+                        wins=0,
+                        losses=0,
+                        total_pnl=Decimal("0"),
+                        gross_profit=Decimal("0"),
+                        gross_loss=Decimal("0"),
+                        win_rate=None,
+                        profit_factor=None,
+                        avg_hold_min=None,
+                        best_trade=None,
+                        worst_trade=None,
+                    )
+                    self._mode = mode
+                    logger.info(f"Synced active session from DB: {session_id} in {mode} mode")
+            else:
+                if self._current_session is not None:
+                    logger.info("No active session in DB, clearing local state")
+                self._current_session = None
+                self._mode = "off"
+        except Exception as e:
+            logger.error(f"Failed to sync session from DB: {e}")
+
     @property
     def mode(self) -> TradingMode:
+        self._sync_from_db()
         return self._mode
 
     @property
     def is_trading(self) -> bool:
+        self._sync_from_db()
         return self._mode != "off" and self._current_session is not None
 
     @property
@@ -146,7 +210,7 @@ class TradingSessionManager:
             self._validate_live_start()
 
         session_id = uuid4()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Insert into database
         with get_conn() as conn:
@@ -190,7 +254,7 @@ class TradingSessionManager:
             raise RuntimeError("No active trading session to stop")
 
         session = self._current_session
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Calculate final stats from trades
         stats = self._calculate_session_stats(session.session_id)
@@ -318,7 +382,7 @@ class TradingSessionManager:
             started_at, mode = rows[0]
             stats["started_at"] = started_at.isoformat()
             stats["mode"] = mode
-            stats["running_time_sec"] = int((datetime.utcnow() - started_at).total_seconds())
+            stats["running_time_sec"] = int((datetime.now(timezone.utc) - started_at).total_seconds())
 
         return stats
 

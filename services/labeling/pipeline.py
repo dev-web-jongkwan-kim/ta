@@ -64,6 +64,7 @@ class LabelingConfig:
     h_bars: int = 360
     risk_mae_atr: float = 3.0
     timeframe: Timeframe = "1m"
+    atr_timeframe: Optional[Timeframe] = None  # ATR 계산용 타임프레임 (None이면 timeframe과 동일)
 
     def spec(self) -> LabelSpec:
         settings = get_settings()
@@ -79,6 +80,7 @@ class LabelingConfig:
             risk_mae_atr=self.risk_mae_atr,
             fee_rate=settings.taker_fee_rate,
             slippage_k=settings.slippage_k,
+            atr_timeframe=self.atr_timeframe or "",
         )
 
 
@@ -185,10 +187,65 @@ def label_symbol(symbol: str, spec: LabelSpec, timeframe: Timeframe = "1m") -> N
     label_symbol_incremental(symbol, spec, force_full=True, timeframe=timeframe)
 
 
+def _calculate_higher_tf_atr(
+    symbol: str,
+    base_candles: pd.DataFrame,
+    atr_timeframe: Timeframe,
+    atr_window: int = 14,
+) -> pd.Series:
+    """상위 타임프레임 ATR을 계산하고 base_candles 타임스탬프에 맞춰 반환
+
+    Returns:
+        pd.Series: ATR 값 (base_candles와 동일한 인덱스)
+    """
+    # 상위 타임프레임 캔들 로드
+    atr_candles = _load_candles(symbol, timeframe=atr_timeframe)
+    if atr_candles.empty:
+        logger.warning(f"{symbol}: no {atr_timeframe} candles for ATR calculation")
+        return pd.Series([float('nan')] * len(base_candles), index=base_candles.index)
+
+    # ATR 계산 (True Range의 롤링 평균)
+    atr_candles = atr_candles.sort_values("ts").reset_index(drop=True)
+    high = atr_candles["high"]
+    low = atr_candles["low"]
+    close_prev = atr_candles["close"].shift(1)
+
+    tr = pd.concat([
+        (high - low),
+        (high - close_prev).abs(),
+        (low - close_prev).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_series = tr.rolling(window=atr_window, min_periods=atr_window).mean()
+    atr_candles["atr"] = atr_series
+
+    # base_candles 타임스탬프에 맞춰 forward-fill
+    atr_candles["ts"] = pd.to_datetime(atr_candles["ts"], utc=True)
+    atr_indexed = atr_candles.set_index("ts")["atr"]
+
+    # base_candles ts도 UTC로 통일
+    base_ts = pd.to_datetime(base_candles["ts"], utc=True)
+
+    # 모든 타임스탬프를 합쳐서 forward-fill
+    combined_index = atr_indexed.index.union(base_ts).sort_values()
+    atr_reindexed = atr_indexed.reindex(combined_index).ffill()
+
+    # base_candles 타임스탬프만 추출하여 Series로 반환
+    result = atr_reindexed.reindex(base_ts)
+    result = result.reset_index(drop=True)  # base_candles와 동일한 인덱스
+    return result
+
+
 def label_symbol_incremental(
-    symbol: str, spec: LabelSpec, force_full: bool = False, timeframe: Timeframe = "1m"
+    symbol: str, spec: LabelSpec, force_full: bool = False, timeframe: Timeframe = "1m",
+    atr_timeframe: Optional[Timeframe] = None,
 ) -> Dict[str, int]:
-    """증분 라벨링 - 새 캔들만 처리"""
+    """증분 라벨링 - 새 캔들만 처리
+
+    Args:
+        atr_timeframe: ATR 계산에 사용할 타임프레임. None이면 timeframe과 동일.
+                      예: timeframe="1m", atr_timeframe="15m"이면 1m 라벨에 15m ATR 사용
+    """
     spec_hash = spec.hash()
     h_bars = spec.h_bars
     atr_window = 14
@@ -202,9 +259,12 @@ def label_symbol_incremental(
         max_ts_long = _get_max_label_timestamp(symbol, spec_hash, long_table)
         max_ts_short = _get_max_label_timestamp(symbol, spec_hash, short_table)
         if max_ts_long and max_ts_short:
-            load_after_ts = min(max_ts_long, max_ts_short)
+            # Convert to pandas Timestamp for consistent comparison
+            max_ts_long_pd = pd.Timestamp(max_ts_long)
+            max_ts_short_pd = pd.Timestamp(max_ts_short)
+            load_after_ts = min(max_ts_long_pd, max_ts_short_pd)
         else:
-            load_after_ts = max_ts_long or max_ts_short
+            load_after_ts = pd.Timestamp(max_ts_long) if max_ts_long else (pd.Timestamp(max_ts_short) if max_ts_short else None)
     else:
         max_ts_long = None
         max_ts_short = None
@@ -234,7 +294,13 @@ def label_symbol_incremental(
 
     # premium 데이터를 candles 타임스탬프에 맞춤
     premium = premium.set_index("ts").reindex(candles["ts"]).ffill().bfill().reset_index()
-    atr = candles["high"].rolling(window=14).max() - candles["low"].rolling(window=14).min()
+
+    # ATR 계산: atr_timeframe이 지정되면 상위 타임프레임 ATR 사용
+    if atr_timeframe and atr_timeframe != timeframe:
+        atr = _calculate_higher_tf_atr(symbol, candles, atr_timeframe, atr_window)
+        logger.debug(f"{symbol}: using {atr_timeframe} ATR for {timeframe} labels")
+    else:
+        atr = candles["high"].rolling(window=14).max() - candles["low"].rolling(window=14).min()
 
     # Long 라벨링
     data = label_direction_vectorized(
@@ -252,7 +318,12 @@ def label_symbol_incremental(
     )
 
     if max_ts_long is not None:
-        new_data = data[data["ts"] > max_ts_long]
+        # Ensure ts column is datetime and compare with UTC timestamp
+        data["ts"] = pd.to_datetime(data["ts"], utc=True)
+        max_ts_long_pd = pd.Timestamp(max_ts_long)
+        if max_ts_long_pd.tzinfo is None:
+            max_ts_long_pd = max_ts_long_pd.tz_localize('UTC')
+        new_data = data[data["ts"] > max_ts_long_pd]
     else:
         new_data = data
 
@@ -289,7 +360,12 @@ def label_symbol_incremental(
     )
 
     if max_ts_short is not None:
-        new_data_short = data_short[data_short["ts"] > max_ts_short]
+        # Ensure ts column is datetime and compare with UTC timestamp
+        data_short["ts"] = pd.to_datetime(data_short["ts"], utc=True)
+        max_ts_short_pd = pd.Timestamp(max_ts_short)
+        if max_ts_short_pd.tzinfo is None:
+            max_ts_short_pd = max_ts_short_pd.tz_localize('UTC')
+        new_data_short = data_short[data_short["ts"] > max_ts_short_pd]
     else:
         new_data_short = data_short
 
@@ -344,8 +420,9 @@ def run_labeling(
     spec_hash = spec.hash()
     universe = list(symbols or settings.universe_list())
 
+    atr_tf_info = f", atr_timeframe={cfg.atr_timeframe}" if cfg.atr_timeframe else ""
     logger.info(
-        f"Starting labeling ({timeframe}): spec_hash={spec_hash}, "
+        f"Starting labeling ({timeframe}{atr_tf_info}): spec_hash={spec_hash}, "
         f"symbols={len(universe)}, force_full={force_full}"
     )
 
@@ -361,7 +438,10 @@ def run_labeling(
     for i, symbol in enumerate(universe, 1):
         logger.debug(f"Processing {symbol} ({i}/{len(universe)})")
         try:
-            result = label_symbol_incremental(symbol, spec, force_full=force_full, timeframe=cfg.timeframe)
+            result = label_symbol_incremental(
+                symbol, spec, force_full=force_full, timeframe=cfg.timeframe,
+                atr_timeframe=cfg.atr_timeframe,
+            )
             stats.by_symbol[symbol] = result
             stats.total_new_labels += result["new_long"] + result["new_short"]
             stats.total_existing += result["existing_long"] + result["existing_short"]

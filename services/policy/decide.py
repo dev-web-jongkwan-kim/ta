@@ -48,8 +48,10 @@ def decide(symbol: str, preds: Dict[str, float], state: Dict[str, Any], cfg: Pol
     if decision == "SHORT" and preds.get("e_mae_short", 0.0) > cfg.mae_max:
         reasons.append("MAE_MAX")
 
-    size_notional = state.get("equity", 0) * 0.05
-    leverage = 3
+    settings = get_settings()
+    # 마진 × 레버리지 = 노셔널 ($30 × 10 = $300)
+    size_notional = settings.position_size * settings.leverage
+    leverage = settings.leverage  # 10x leverage
 
     return {
         "symbol": symbol,

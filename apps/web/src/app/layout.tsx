@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { ToastProvider } from "@/contexts/ToastContext";
+import { WebSocketStatusProvider } from "@/contexts/WebSocketStatusContext";
 import Sidebar from "@/components/layout/Sidebar";
 import Topbar from "@/components/layout/Topbar";
 import WebSocketMonitor from "@/components/monitors/WebSocketMonitor";
@@ -49,14 +50,16 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className="font-body">
         <ThemeProvider>
           <ToastProvider>
-            <WebSocketMonitor />
-            <div className="flex min-h-screen">
-              <Sidebar />
-              <div className="flex-1 flex flex-col min-w-0">
-                <Topbar />
-                <main className="flex-1 p-6 overflow-auto">{children}</main>
+            <WebSocketStatusProvider>
+              <WebSocketMonitor />
+              <div className="flex min-h-screen">
+                <Sidebar />
+                <div className="flex-1 flex flex-col min-w-0">
+                  <Topbar />
+                  <main className="flex-1 p-6 overflow-auto">{children}</main>
+                </div>
               </div>
-            </div>
+            </WebSocketStatusProvider>
           </ToastProvider>
         </ThemeProvider>
       </body>

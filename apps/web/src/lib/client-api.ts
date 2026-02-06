@@ -4,10 +4,10 @@
 export function getClientApiBase(): string {
   // 브라우저에서는 항상 localhost 사용
   if (typeof window !== "undefined") {
-    return "http://localhost:8000";
+    return "http://localhost:7101";
   }
   // 서버사이드에서는 Docker 내부 URL 사용
-  return process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  return process.env.NEXT_PUBLIC_API_BASE || "http://localhost:7101";
 }
 
 export async function clientFetch(path: string) {

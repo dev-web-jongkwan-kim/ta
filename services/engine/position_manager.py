@@ -86,6 +86,8 @@ class PositionManager:
         amt: float,
         entry_price: float,
         trade_group_id: Optional[str] = None,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
     ) -> None:
         """
         Update cached position from UserDataHandler.
@@ -97,10 +99,13 @@ class PositionManager:
             self._positions.pop(symbol, None)
             return
 
-        # Fetch SL/TP from signals table
-        sl_price, tp_price = self._fetch_sl_tp(symbol)
+        # Use provided SL/TP or fetch from signals table
+        if sl_price is None or tp_price is None:
+            fetched_sl, fetched_tp = self._fetch_sl_tp(symbol)
+            sl_price = sl_price or fetched_sl
+            tp_price = tp_price or fetched_tp
 
-        self._positions[symbol] = OpenPosition(
+        position = OpenPosition(
             symbol=symbol,
             side="LONG" if amt > 0 else "SHORT",
             amt=abs(amt),
@@ -110,8 +115,47 @@ class PositionManager:
             sl_price=sl_price,
             tp_price=tp_price,
         )
+        self._positions[symbol] = position
+
+        # Persist to database for cross-container visibility
+        self._persist_position(position)
 
         logger.debug(f"Position updated: {symbol} {side} amt={amt} SL={sl_price} TP={tp_price}")
+
+    def _persist_position(self, position: OpenPosition, event_type: str = "entry") -> None:
+        """Persist position to database."""
+        try:
+            from uuid import uuid4
+            # Use trade_group_id from position or generate a new one
+            trade_group_id = position.trade_group_id or uuid4()
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # Use the actual primary key for conflict resolution
+                    cur.execute("""
+                        INSERT INTO positions (symbol, ts, side, amt, entry_price, trade_group_id, event_type, sl_price, tp_price)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (trade_group_id, symbol, ts, side) DO UPDATE SET
+                            amt = EXCLUDED.amt,
+                            entry_price = EXCLUDED.entry_price,
+                            event_type = EXCLUDED.event_type,
+                            sl_price = EXCLUDED.sl_price,
+                            tp_price = EXCLUDED.tp_price
+                    """, (
+                        position.symbol,
+                        position.entry_time,
+                        position.side,
+                        position.amt if position.side == "LONG" else -position.amt,
+                        position.entry_price,
+                        str(trade_group_id),
+                        event_type,
+                        position.sl_price,
+                        position.tp_price,
+                    ))
+                conn.commit()
+                logger.debug(f"Persisted position: {position.symbol} {position.side} event_type={event_type}")
+        except Exception as e:
+            logger.error(f"Failed to persist position: {e}")
 
     def check_sl_tp(
         self,
@@ -205,6 +249,20 @@ class PositionManager:
             "trade_group_id": position.trade_group_id,
         }
 
+        # Persist final position state to database
+        # For FINAL record, store exit_price in entry_price column
+        final_position = OpenPosition(
+            symbol=position.symbol,
+            side=position.side,
+            amt=position.amt,
+            entry_price=exit_price,  # Store actual exit price for FINAL record
+            entry_time=exit_time,  # Use exit time for FINAL record timestamp
+            trade_group_id=position.trade_group_id,
+            sl_price=position.sl_price,
+            tp_price=position.tp_price,
+        )
+        self._persist_position(final_position, event_type="FINAL")
+
         # Remove from cache
         self._positions.pop(symbol, None)
         self._last_hit_time.pop(symbol, None)
@@ -227,26 +285,191 @@ class PositionManager:
         """Get cached position for a symbol."""
         return self._positions.get(symbol)
 
+    def has_open_position_in_db(self, symbol: str) -> bool:
+        """
+        Check if symbol has an open position in the database.
+
+        This is a more reliable check than in-memory state, used to prevent
+        duplicate entries when the in-memory state might be stale.
+        """
+        try:
+            rows = fetch_all("""
+                SELECT 1
+                FROM positions p
+                WHERE p.symbol = %s
+                AND p.event_type = 'entry'
+                AND NOT EXISTS (
+                    SELECT 1 FROM positions p2
+                    WHERE p2.trade_group_id = p.trade_group_id
+                    AND p2.event_type = 'FINAL'
+                )
+                LIMIT 1
+            """, (symbol,))
+            return len(rows) > 0
+        except Exception as e:
+            logger.error(f"Failed to check open position in DB for {symbol}: {e}")
+            return False
+
+    def count_open_positions_in_db(self) -> int:
+        """
+        Count total open positions in the database.
+
+        This is a more reliable count than in-memory state.
+        """
+        try:
+            rows = fetch_all("""
+                SELECT COUNT(DISTINCT symbol)
+                FROM positions p
+                WHERE p.event_type = 'entry'
+                AND NOT EXISTS (
+                    SELECT 1 FROM positions p2
+                    WHERE p2.trade_group_id = p.trade_group_id
+                    AND p2.event_type = 'FINAL'
+                )
+            """)
+            return rows[0][0] if rows else 0
+        except Exception as e:
+            logger.error(f"Failed to count open positions in DB: {e}")
+            return len(self._positions)
+
     def get_all_positions(self) -> Dict[str, OpenPosition]:
-        """Get all cached positions."""
-        return self._positions.copy()
+        """Get all open positions from database.
+
+        Returns entries without corresponding FINAL records (actual open positions).
+        If a symbol has multiple open entries, returns the latest one.
+        """
+        positions: Dict[str, OpenPosition] = {}
+        try:
+            # Get open positions: entries without corresponding FINAL records
+            rows = fetch_all("""
+                WITH open_entries AS (
+                    SELECT
+                        p.symbol, p.side, p.amt, p.entry_price, p.ts, p.trade_group_id, p.sl_price, p.tp_price,
+                        ROW_NUMBER() OVER (PARTITION BY p.symbol ORDER BY p.ts DESC) as rn
+                    FROM positions p
+                    WHERE p.event_type = 'entry'
+                    AND p.amt != 0
+                    AND NOT EXISTS (
+                        SELECT 1 FROM positions p2
+                        WHERE p2.trade_group_id = p.trade_group_id
+                        AND p2.event_type = 'FINAL'
+                    )
+                )
+                SELECT symbol, side, amt, entry_price, ts, trade_group_id, sl_price, tp_price
+                FROM open_entries
+                WHERE rn = 1
+            """)
+            for row in rows:
+                symbol, side, amt, entry_price, ts, trade_group_id, sl_price, tp_price = row
+                if amt and abs(amt) > 1e-8:
+                    positions[symbol] = OpenPosition(
+                        symbol=symbol,
+                        side=side,
+                        amt=abs(amt),
+                        entry_price=float(entry_price) if entry_price else 0,
+                        entry_time=ts,
+                        trade_group_id=trade_group_id,
+                        sl_price=float(sl_price) if sl_price else None,
+                        tp_price=float(tp_price) if tp_price else None,
+                    )
+        except Exception as e:
+            logger.error(f"Failed to get positions from DB: {e}")
+        return positions
+
+    def _cleanup_orphaned_entries(self) -> None:
+        """
+        Clean up orphaned entries on startup.
+
+        When the worker restarts, older entries may exist without FINAL records.
+        This marks older duplicates (per symbol) as FINAL to keep the DB clean.
+        """
+        try:
+            from datetime import datetime, timezone
+
+            # Find symbols with multiple open entries (entry without FINAL)
+            duplicates = fetch_all("""
+                WITH open_entries AS (
+                    SELECT
+                        p.symbol, p.ts, p.side, p.trade_group_id, p.entry_price, p.amt,
+                        p.sl_price, p.tp_price,
+                        ROW_NUMBER() OVER (PARTITION BY p.symbol ORDER BY p.ts DESC) as rn
+                    FROM positions p
+                    WHERE p.event_type = 'entry'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM positions p2
+                        WHERE p2.trade_group_id = p.trade_group_id
+                        AND p2.event_type = 'FINAL'
+                    )
+                )
+                SELECT symbol, ts, side, trade_group_id, entry_price, amt, sl_price, tp_price
+                FROM open_entries
+                WHERE rn > 1
+            """)
+
+            if not duplicates:
+                return
+
+            logger.info(f"Cleaning up {len(duplicates)} orphaned position entries...")
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for row in duplicates:
+                        symbol, ts, side, trade_group_id, entry_price, amt, sl_price, tp_price = row
+                        exit_time = datetime.now(timezone.utc)
+
+                        # Insert FINAL record to close this orphaned position
+                        cur.execute("""
+                            INSERT INTO positions (symbol, ts, side, amt, entry_price, trade_group_id, event_type, sl_price, tp_price)
+                            VALUES (%s, %s, %s, %s, %s, %s, 'FINAL', %s, %s)
+                            ON CONFLICT (trade_group_id, symbol, ts, side) DO NOTHING
+                        """, (symbol, exit_time, side, amt, entry_price, str(trade_group_id), sl_price, tp_price))
+
+                        logger.info(f"Closed orphaned entry: {symbol} @ {ts}")
+
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup orphaned entries: {e}")
 
     def load_positions_from_db(self) -> None:
-        """Load open positions from database on startup."""
+        """Load open positions from database on startup.
+
+        Loads entries without corresponding FINAL records (actual open positions).
+        Also cleans up orphaned duplicate entries first.
+        """
+        # First, clean up any orphaned duplicate entries from previous runs
+        self._cleanup_orphaned_entries()
+
         try:
-            # Get latest positions where amt != 0
+            # Get open positions: entries without corresponding FINAL records
+            # Use the LATEST entry per symbol (in case of duplicates)
             rows = fetch_all("""
-                SELECT DISTINCT ON (symbol)
-                    symbol, side, amt, entry_price, ts, trade_group_id
-                FROM positions
-                WHERE amt != 0
-                ORDER BY symbol, ts DESC
+                WITH open_entries AS (
+                    SELECT
+                        p.symbol, p.side, p.amt, p.entry_price, p.ts, p.trade_group_id, p.sl_price, p.tp_price,
+                        ROW_NUMBER() OVER (PARTITION BY p.symbol ORDER BY p.ts DESC) as rn
+                    FROM positions p
+                    WHERE p.event_type = 'entry'
+                    AND p.amt != 0
+                    AND NOT EXISTS (
+                        SELECT 1 FROM positions p2
+                        WHERE p2.trade_group_id = p.trade_group_id
+                        AND p2.event_type = 'FINAL'
+                    )
+                )
+                SELECT symbol, side, amt, entry_price, ts, trade_group_id, sl_price, tp_price
+                FROM open_entries
+                WHERE rn = 1
             """)
 
             for row in rows:
-                symbol, side, amt, entry_price, ts, trade_group_id = row
+                symbol, side, amt, entry_price, ts, trade_group_id, sl_price, tp_price = row
                 if amt and abs(amt) > 1e-8:
-                    sl_price, tp_price = self._fetch_sl_tp(symbol)
+                    # If SL/TP not in positions table, try fetching from signals
+                    if sl_price is None or tp_price is None:
+                        fetched_sl, fetched_tp = self._fetch_sl_tp(symbol)
+                        sl_price = sl_price or fetched_sl
+                        tp_price = tp_price or fetched_tp
                     self._positions[symbol] = OpenPosition(
                         symbol=symbol,
                         side=side,
@@ -254,8 +477,8 @@ class PositionManager:
                         entry_price=float(entry_price) if entry_price else 0,
                         entry_time=ts,
                         trade_group_id=trade_group_id,
-                        sl_price=sl_price,
-                        tp_price=tp_price,
+                        sl_price=float(sl_price) if sl_price else None,
+                        tp_price=float(tp_price) if tp_price else None,
                     )
 
             logger.info(f"Loaded {len(self._positions)} positions from database")

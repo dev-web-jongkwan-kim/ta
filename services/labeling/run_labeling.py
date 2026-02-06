@@ -62,19 +62,46 @@ def main() -> None:
         action="store_true",
         help="상세 로그 출력",
     )
+    parser.add_argument(
+        "--timeframe",
+        "-t",
+        type=str,
+        default="1m",
+        choices=["1m", "15m", "1h"],
+        help="타임프레임 (기본값: 1m)",
+    )
+    parser.add_argument(
+        "--atr-timeframe",
+        type=str,
+        default=None,
+        choices=["1m", "15m", "1h"],
+        help="ATR 계산용 타임프레임 (기본값: timeframe과 동일). 예: --timeframe 1m --atr-timeframe 15m",
+    )
     args = parser.parse_args()
 
     setup_logging(args.verbose)
 
+    # h_bars 조정: 15m이면 h_bars=24 (6시간), 1h이면 h_bars=6 (6시간)
+    h_bars = args.h_bars
+    if args.timeframe == "15m" and args.h_bars == 360:
+        h_bars = 24  # 15분 × 24 = 6시간
+        logger.info(f"h_bars adjusted for 15m: {args.h_bars} -> {h_bars}")
+    elif args.timeframe == "1h" and args.h_bars == 360:
+        h_bars = 6  # 1시간 × 6 = 6시간
+        logger.info(f"h_bars adjusted for 1h: {args.h_bars} -> {h_bars}")
+
     config = LabelingConfig(
         k_tp=args.k_tp,
         k_sl=args.k_sl,
-        h_bars=args.h_bars,
+        h_bars=h_bars,
         risk_mae_atr=args.risk_mae_atr,
+        timeframe=args.timeframe,
+        atr_timeframe=args.atr_timeframe,
     )
 
-    logger.info(f"Starting labeling (force_full={args.force_full})")
-    logger.info(f"Config: k_tp={config.k_tp}, k_sl={config.k_sl}, h_bars={config.h_bars}, risk_mae_atr={config.risk_mae_atr}")
+    atr_tf_info = f", atr_timeframe={config.atr_timeframe}" if config.atr_timeframe else ""
+    logger.info(f"Starting labeling (force_full={args.force_full}, timeframe={config.timeframe}{atr_tf_info})")
+    logger.info(f"Config: k_tp={config.k_tp}, k_sl={config.k_sl}, h_bars={config.h_bars}, risk_mae_atr={config.risk_mae_atr}, timeframe={config.timeframe}, atr_timeframe={config.atr_timeframe}")
 
     stats = run_labeling(
         config=config,

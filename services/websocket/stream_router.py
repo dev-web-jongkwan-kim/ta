@@ -52,12 +52,14 @@ class StreamRouter:
             return
 
         # Extract stream type (e.g., "kline_1m" from "btcusdt@kline_1m")
+        # Handle multi-part types like "markPrice@1s" -> "markPrice@1s"
         parts = stream.split("@")
         if len(parts) < 2:
             self.stats["unhandled_messages"] += 1
             return
 
-        stream_type = parts[1]  # "kline_1m", "markPrice", etc.
+        # Join all parts after the symbol
+        stream_type = "@".join(parts[1:])  # "kline_1m", "markPrice@1s", etc.
 
         # Find matching handler
         handler = self.handlers.get(stream_type)

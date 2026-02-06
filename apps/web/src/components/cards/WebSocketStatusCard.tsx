@@ -1,43 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { getClientApiBase } from "@/lib/client-api";
-
-interface WebsocketStatus {
-  connected: boolean;
-  uptime_sec: number;
-  last_message_ago_sec: number | null;
-  reconnect_count: number;
-  streams_active: number;
-  streams_total: number;
-  total_messages: number;
-  message_counts: Record<string, number>;
-}
+import { useWebSocketStatus } from "@/contexts/WebSocketStatusContext";
 
 export default function WebSocketStatusCard() {
-  const [status, setStatus] = useState<WebsocketStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const fetchStatus = async () => {
-      try {
-        const apiBase = getClientApiBase();
-        const res = await fetch(`${apiBase}/api/websocket/status`);
-        if (res.ok) {
-          const data = await res.json();
-          setStatus(data);
-        }
-      } catch (e) {
-        console.error("Failed to fetch WS status:", e);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 2000);
-    return () => clearInterval(interval);
-  }, []);
+  const { status, loading } = useWebSocketStatus();
 
   const formatUptime = (seconds: number) => {
     if (seconds < 60) return `${seconds}s`;

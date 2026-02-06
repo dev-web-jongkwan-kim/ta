@@ -89,8 +89,8 @@ def _get_feature_table(timeframe: Timeframe) -> str:
     return f"features_{timeframe}"
 
 
-def _get_label_table(timeframe: Timeframe) -> str:
-    return f"labels_long_{timeframe}"
+def _get_label_table(timeframe: Timeframe, direction: str = "long") -> str:
+    return f"labels_{direction}_{timeframe}"
 
 
 def _load_dataset(
@@ -100,12 +100,23 @@ def _load_dataset(
     end_date: str | None = None,
     timeframe: Timeframe = "1m",
     symbols: List[str] | None = None,
+    include_short: bool = True,
 ) -> pd.DataFrame:
-    """Load dataset symbol-by-symbol to reduce peak memory usage."""
+    """Load dataset symbol-by-symbol to reduce peak memory usage.
+
+    Optimized: loads tables separately and merges in pandas (faster than SQL JOIN).
+
+    Args:
+        include_short: If True, also load short labels and include them as separate columns.
+    """
     import gc
+    import logging
+
+    logger = logging.getLogger(__name__)
 
     feature_table = _get_feature_table(timeframe)
-    label_table = _get_label_table(timeframe)
+    label_table_long = _get_label_table(timeframe, "long")
+    label_table_short = _get_label_table(timeframe, "short")
 
     # Get symbols if not specified
     if symbols:
@@ -119,63 +130,112 @@ def _load_dataset(
     all_dfs = []
     feature_cols = None
 
-    for symbol in symbols_list:
-        query = f"""
-            SELECT f.symbol, f.ts, f.features, f.schema_version, f.atr, f.funding_z, f.btc_regime,
-                   l.ret_net, l.mae, l.time_to_event_min
-            FROM {feature_table} f
-            JOIN {label_table} l
-              ON f.symbol = l.symbol AND f.ts = l.ts
-            WHERE f.schema_version = %s AND l.spec_hash = %s AND f.symbol = %s
-        """
-        params: list = [feature_schema_version, label_spec_hash, symbol]
-        if start_date:
-            query += " AND f.ts >= %s"
-            params.append(start_date)
-        if end_date:
-            query += " AND f.ts <= %s"
-            params.append(end_date)
-        query += " ORDER BY f.ts"
+    # Build date filter
+    date_filter = ""
+    date_params: list = []
+    if start_date:
+        date_filter += " AND ts >= %s"
+        date_params.append(start_date)
+    if end_date:
+        date_filter += " AND ts <= %s"
+        date_params.append(end_date)
 
-        rows = fetch_all(query, tuple(params))
-        if not rows:
+    total_symbols = len(symbols_list)
+    for idx, symbol in enumerate(symbols_list, 1):
+        logger.info(f"[{idx}/{total_symbols}] {symbol} 데이터 로딩...")
+
+        # 1. Load features (no JOIN)
+        query_features = f"""
+            SELECT symbol, ts, features, schema_version, atr, funding_z, btc_regime
+            FROM {feature_table}
+            WHERE symbol = %s AND schema_version = %s {date_filter}
+            ORDER BY ts
+        """
+        params_features = [symbol, feature_schema_version] + date_params
+        rows_features = fetch_all(query_features, tuple(params_features))
+        if not rows_features:
             continue
 
-        df = pd.DataFrame(
-            rows,
-            columns=[
-                "symbol",
-                "ts",
-                "features",
-                "schema_version",
-                "atr",
-                "funding_z",
-                "btc_regime",
-                "ret_net",
-                "mae",
-                "time_to_event_min",
-            ],
+        df_features = pd.DataFrame(
+            rows_features,
+            columns=["symbol", "ts", "features", "schema_version", "atr", "funding_z", "btc_regime"],
         )
+        df_features["ts"] = pd.to_datetime(df_features["ts"], utc=True)
+
+        # 2. Load long labels (no JOIN)
+        query_long = f"""
+            SELECT ts, ret_net, mae, time_to_event_min
+            FROM {label_table_long}
+            WHERE symbol = %s AND spec_hash = %s {date_filter}
+            ORDER BY ts
+        """
+        params_long = [symbol, label_spec_hash] + date_params
+        rows_long = fetch_all(query_long, tuple(params_long))
+        if not rows_long:
+            continue
+
+        df_long = pd.DataFrame(
+            rows_long,
+            columns=["ts", "ret_net_long", "mae_long", "time_to_event_min_long"],
+        )
+        df_long["ts"] = pd.to_datetime(df_long["ts"], utc=True)
+
+        # 3. Load short labels if needed (no JOIN)
+        df_short = None
+        if include_short:
+            query_short = f"""
+                SELECT ts, ret_net, mae, time_to_event_min
+                FROM {label_table_short}
+                WHERE symbol = %s AND spec_hash = %s {date_filter}
+                ORDER BY ts
+            """
+            params_short = [symbol, label_spec_hash] + date_params
+            rows_short = fetch_all(query_short, tuple(params_short))
+            if rows_short:
+                df_short = pd.DataFrame(
+                    rows_short,
+                    columns=["ts", "ret_net_short", "mae_short", "time_to_event_min_short"],
+                )
+                df_short["ts"] = pd.to_datetime(df_short["ts"], utc=True)
+
+        # 4. Merge in pandas (much faster than SQL JOIN)
+        df = df_features.merge(df_long, on="ts", how="inner")
+        if df_short is not None:
+            df = df.merge(df_short, on="ts", how="inner")
+        else:
+            # For backward compatibility when not including short
+            df["ret_net"] = df["ret_net_long"]
+            df["mae"] = df["mae_long"]
+            df["time_to_event_min"] = df["time_to_event_min_long"]
+
+        del rows_features, rows_long, df_features, df_long
+        if df_short is not None:
+            del rows_short, df_short
+        gc.collect()
+
+        if df.empty:
+            continue
 
         df, cols = _normalize_features(df)
         if feature_cols is None:
             feature_cols = cols
 
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
         all_dfs.append(df)
+        logger.info(f"  → {symbol}: {len(df):,}행")
 
-        del rows
         gc.collect()
 
     if not all_dfs:
         return pd.DataFrame()
 
+    logger.info(f"전체 {len(all_dfs)}개 심볼 데이터 병합 중...")
     result = pd.concat(all_dfs, ignore_index=True)
     del all_dfs
     gc.collect()
 
     result = result.sort_values("ts")
     result["feature_cols"] = [feature_cols] * len(result)
+    logger.info(f"데이터 로딩 완료: 총 {len(result):,}행")
     return result
 
 
@@ -185,9 +245,23 @@ def _load_multi_tf_dataset(
     start_date: str | None = None,
     end_date: str | None = None,
     symbols: List[str] | None = None,
+    base_timeframe: Timeframe = "1m",
+    include_short: bool = True,
 ) -> pd.DataFrame:
-    """Load dataset with multi-timeframe features (1m + 15m + 1h)."""
+    """Load dataset with multi-timeframe features (1m + 15m + 1h).
+
+    The base timeframe controls which labels/features define the rows.
+    Other timeframes are forward-filled onto the base timestamps.
+
+    Optimized: loads tables separately and merges in pandas (faster than SQL JOIN).
+
+    Args:
+        include_short: If True, also load short labels and include them as separate columns.
+    """
     import gc
+    import logging
+
+    logger = logging.getLogger(__name__)
 
     # Get symbols if not specified
     if symbols:
@@ -201,117 +275,157 @@ def _load_multi_tf_dataset(
     all_dfs = []
     all_feature_cols = None
 
-    for symbol in symbols_list:
-        # Load 1m features with labels
-        query_1m = """
-            SELECT f.symbol, f.ts, f.features, f.schema_version, f.atr, f.funding_z, f.btc_regime,
-                   l.ret_net, l.mae, l.time_to_event_min
-            FROM features_1m f
-            JOIN labels_long_1m l
-              ON f.symbol = l.symbol AND f.ts = l.ts
-            WHERE f.schema_version = %s AND l.spec_hash = %s AND f.symbol = %s
-        """
-        params: list = [feature_schema_version, label_spec_hash, symbol]
-        if start_date:
-            query_1m += " AND f.ts >= %s"
-            params.append(start_date)
-        if end_date:
-            query_1m += " AND f.ts <= %s"
-            params.append(end_date)
-        query_1m += " ORDER BY f.ts"
+    total_symbols = len(symbols_list)
+    for idx, symbol in enumerate(symbols_list, 1):
+        logger.info(f"[{idx}/{total_symbols}] {symbol} 데이터 로딩 시작...")
 
-        rows_1m = fetch_all(query_1m, tuple(params))
-        if not rows_1m:
+        base_feature_table = _get_feature_table(base_timeframe)
+        base_label_table_long = _get_label_table(base_timeframe, "long")
+        base_label_table_short = _get_label_table(base_timeframe, "short")
+        prefix_base = f"f_{base_timeframe}"
+
+        # Build date filter
+        date_filter = ""
+        date_params: list = []
+        if start_date:
+            date_filter += " AND ts >= %s"
+            date_params.append(start_date)
+        if end_date:
+            date_filter += " AND ts <= %s"
+            date_params.append(end_date)
+
+        # 1. Load features (no JOIN)
+        query_features = f"""
+            SELECT symbol, ts, features, schema_version, atr, funding_z, btc_regime
+            FROM {base_feature_table}
+            WHERE symbol = %s AND schema_version = %s {date_filter}
+            ORDER BY ts
+        """
+        params_features = [symbol, feature_schema_version] + date_params
+        rows_features = fetch_all(query_features, tuple(params_features))
+        if not rows_features:
+            logger.info(f"  → {symbol}: features 없음, 건너뜀")
             continue
 
-        df_1m = pd.DataFrame(
-            rows_1m,
-            columns=[
-                "symbol", "ts", "features", "schema_version", "atr", "funding_z", "btc_regime",
-                "ret_net", "mae", "time_to_event_min",
-            ],
+        df_features = pd.DataFrame(
+            rows_features,
+            columns=["symbol", "ts", "features", "schema_version", "atr", "funding_z", "btc_regime"],
         )
-        df_1m["ts"] = pd.to_datetime(df_1m["ts"], utc=True)
+        df_features["ts"] = pd.to_datetime(df_features["ts"], utc=True)
+        logger.info(f"  → features: {len(df_features):,}행")
 
-        # Normalize 1m features
-        df_1m, cols_1m = _normalize_features(df_1m, prefix="f_1m")
-
-        # Load 15m features
-        query_15m = """
-            SELECT ts, features FROM features_15m WHERE symbol = %s
+        # 2. Load long labels (no JOIN)
+        query_long = f"""
+            SELECT ts, ret_net, mae, time_to_event_min
+            FROM {base_label_table_long}
+            WHERE symbol = %s AND spec_hash = %s {date_filter}
+            ORDER BY ts
         """
-        params_15m = [symbol]
-        if start_date:
-            query_15m += " AND ts >= %s"
-            params_15m.append(start_date)
-        if end_date:
-            query_15m += " AND ts <= %s"
-            params_15m.append(end_date)
-        query_15m += " ORDER BY ts"
+        params_long = [symbol, label_spec_hash] + date_params
+        rows_long = fetch_all(query_long, tuple(params_long))
+        if not rows_long:
+            logger.info(f"  → {symbol}: long labels 없음, 건너뜀")
+            continue
 
-        rows_15m = fetch_all(query_15m, tuple(params_15m))
-        if rows_15m:
-            df_15m = pd.DataFrame(rows_15m, columns=["ts", "features"])
-            df_15m["ts"] = pd.to_datetime(df_15m["ts"], utc=True)
-            df_15m, cols_15m = _normalize_features(df_15m, prefix="f_15m")
-            df_15m = df_15m.set_index("ts")
+        df_long = pd.DataFrame(
+            rows_long,
+            columns=["ts", "ret_net_long", "mae_long", "time_to_event_min_long"],
+        )
+        df_long["ts"] = pd.to_datetime(df_long["ts"], utc=True)
+        logger.info(f"  → long labels: {len(df_long):,}행")
 
-            # Join 15m features to 1m using forward-fill
-            df_1m = df_1m.set_index("ts")
-            for col in cols_15m:
-                df_1m[col] = df_15m[col].reindex(df_1m.index, method="ffill").values
-            df_1m = df_1m.reset_index()
-        else:
-            cols_15m = []
+        # 3. Load short labels if needed (no JOIN)
+        df_short = None
+        if include_short:
+            query_short = f"""
+                SELECT ts, ret_net, mae, time_to_event_min
+                FROM {base_label_table_short}
+                WHERE symbol = %s AND spec_hash = %s {date_filter}
+                ORDER BY ts
+            """
+            params_short = [symbol, label_spec_hash] + date_params
+            rows_short = fetch_all(query_short, tuple(params_short))
+            if rows_short:
+                df_short = pd.DataFrame(
+                    rows_short,
+                    columns=["ts", "ret_net_short", "mae_short", "time_to_event_min_short"],
+                )
+                df_short["ts"] = pd.to_datetime(df_short["ts"], utc=True)
+                logger.info(f"  → short labels: {len(df_short):,}행")
 
-        # Load 1h features
-        query_1h = """
-            SELECT ts, features FROM features_1h WHERE symbol = %s
-        """
-        params_1h = [symbol]
-        if start_date:
-            query_1h += " AND ts >= %s"
-            params_1h.append(start_date)
-        if end_date:
-            query_1h += " AND ts <= %s"
-            params_1h.append(end_date)
-        query_1h += " ORDER BY ts"
+        # 4. Merge in pandas (much faster than SQL JOIN)
+        df_base = df_features.merge(df_long, on="ts", how="inner")
+        if df_short is not None:
+            df_base = df_base.merge(df_short, on="ts", how="inner")
+        logger.info(f"  → merge 후: {len(df_base):,}행")
 
-        rows_1h = fetch_all(query_1h, tuple(params_1h))
-        if rows_1h:
-            df_1h = pd.DataFrame(rows_1h, columns=["ts", "features"])
-            df_1h["ts"] = pd.to_datetime(df_1h["ts"], utc=True)
-            df_1h, cols_1h = _normalize_features(df_1h, prefix="f_1h")
-            df_1h = df_1h.set_index("ts")
+        del rows_features, rows_long, df_features, df_long
+        if df_short is not None:
+            del rows_short, df_short
+        gc.collect()
 
-            # Join 1h features to 1m using forward-fill
-            if "ts" in df_1m.columns:
-                df_1m = df_1m.set_index("ts")
-            for col in cols_1h:
-                df_1m[col] = df_1h[col].reindex(df_1m.index, method="ffill").values
-            df_1m = df_1m.reset_index()
-        else:
-            cols_1h = []
+        if df_base.empty:
+            continue
+
+        # Normalize base features
+        df_base, cols_base = _normalize_features(df_base, prefix=prefix_base)
+
+        # Join other timeframes' features onto base timestamps
+        cols_other: list[str] = []
+        for tf in ["1m", "15m", "1h"]:
+            if tf == base_timeframe:
+                continue
+
+            query_tf = """
+                SELECT ts, features FROM features_{tf} WHERE symbol = %s
+            """.format(tf=tf)
+            params_tf = [symbol]
+            if start_date:
+                query_tf += " AND ts >= %s"
+                params_tf.append(start_date)
+            if end_date:
+                query_tf += " AND ts <= %s"
+                params_tf.append(end_date)
+            query_tf += " ORDER BY ts"
+
+            rows_tf = fetch_all(query_tf, tuple(params_tf))
+            if not rows_tf:
+                continue
+
+            df_tf = pd.DataFrame(rows_tf, columns=["ts", "features"])
+            df_tf["ts"] = pd.to_datetime(df_tf["ts"], utc=True)
+            df_tf, cols_tf = _normalize_features(df_tf, prefix=f"f_{tf}")
+            df_tf = df_tf.set_index("ts")
+
+            df_base = df_base.set_index("ts")
+            for col in cols_tf:
+                df_base[col] = df_tf[col].reindex(df_base.index, method="ffill").values
+            df_base = df_base.reset_index()
+
+            cols_other += cols_tf
+            logger.info(f"  → {tf} features 병합 완료")
 
         # Combine all feature columns
-        all_cols = cols_1m + cols_15m + cols_1h
+        all_cols = cols_base + cols_other
         if all_feature_cols is None:
             all_feature_cols = all_cols
 
-        df_1m["feature_cols"] = [all_cols] * len(df_1m)
-        all_dfs.append(df_1m)
+        df_base["feature_cols"] = [all_cols] * len(df_base)
+        all_dfs.append(df_base)
+        logger.info(f"  → {symbol} 완료: {len(df_base):,}행, {len(all_cols)}개 피처")
 
-        del rows_1m
         gc.collect()
 
     if not all_dfs:
         return pd.DataFrame()
 
+    logger.info(f"전체 {len(all_dfs)}개 심볼 데이터 병합 중...")
     result = pd.concat(all_dfs, ignore_index=True)
     del all_dfs
     gc.collect()
 
     result = result.sort_values("ts")
+    logger.info(f"데이터 로딩 완료: 총 {len(result):,}행")
     return result
 
 
@@ -349,6 +463,9 @@ def _train_regressor(
 
 
 def run_training_job(cfg: TrainConfig, symbols: List[str] | None = None) -> Dict[str, Any]:
+    # Check if any short targets are requested
+    include_short = any(t.endswith("_short") for t in cfg.targets)
+
     if cfg.use_multi_tf:
         df = _load_multi_tf_dataset(
             cfg.label_spec_hash,
@@ -356,6 +473,8 @@ def run_training_job(cfg: TrainConfig, symbols: List[str] | None = None) -> Dict
             start_date=cfg.train_start,
             end_date=cfg.val_end,
             symbols=symbols,
+            base_timeframe=cfg.timeframe,
+            include_short=include_short,
         )
     else:
         df = _load_dataset(
@@ -365,6 +484,7 @@ def run_training_job(cfg: TrainConfig, symbols: List[str] | None = None) -> Dict
             end_date=cfg.val_end,
             timeframe=cfg.timeframe,
             symbols=symbols,
+            include_short=include_short,
         )
 
     if df.empty:
@@ -393,12 +513,26 @@ def run_training_job(cfg: TrainConfig, symbols: List[str] | None = None) -> Dict
         raise ValueError("X_val contains NaN or inf values after cleanup")
 
     metrics: Dict[str, Any] = {}
+    # Check if we have short labels
+    has_short = "ret_net_short" in train_df.columns
+
     target_map = {
-        "er_long": "ret_net",
-        "q05_long": "ret_net",
-        "e_mae_long": "mae",
-        "e_hold_long": "time_to_event_min",
+        "er_long": "ret_net_long",
+        "q05_long": "ret_net_long",
+        "e_mae_long": "mae_long",
+        "e_hold_long": "time_to_event_min_long",
+        "er_short": "ret_net_short",
+        "q05_short": "ret_net_short",
+        "e_mae_short": "mae_short",
+        "e_hold_short": "time_to_event_min_short",
     }
+    # Backward compatibility: map old column names if they exist
+    if "ret_net" in train_df.columns and "ret_net_long" not in train_df.columns:
+        target_map["er_long"] = "ret_net"
+        target_map["q05_long"] = "ret_net"
+        target_map["e_mae_long"] = "mae"
+        target_map["e_hold_long"] = "time_to_event_min"
+
     models: Dict[str, Any] = {}
 
     for target in cfg.targets:
@@ -426,14 +560,52 @@ def run_training_job(cfg: TrainConfig, symbols: List[str] | None = None) -> Dict
         if alpha is not None:
             metrics[target]["pinball_loss"] = _pinball_loss(y_val_clean, preds, alpha)
 
-    metrics["trade"] = _trade_metrics(val_df["ret_net"].fillna(0.0))
+    # Trade metrics for long (use ret_net_long if available, otherwise ret_net for backward compat)
+    ret_col_long = "ret_net_long" if "ret_net_long" in val_df.columns else "ret_net"
+    metrics["trade_long"] = _trade_metrics(val_df[ret_col_long].fillna(0.0))
+    metrics["trade"] = metrics["trade_long"]  # Backward compatibility
+
+    # Trade metrics for short if available
+    if "ret_net_short" in val_df.columns:
+        metrics["trade_short"] = _trade_metrics(val_df["ret_net_short"].fillna(0.0))
+
+    # Filtered metrics using model predictions - LONG
+    if "er_long" in models and "er_long" in cfg.targets:
+        er_preds_long = models["er_long"].predict(X_val)
+        val_df_copy = val_df.copy()
+        val_df_copy["pred_er_long"] = er_preds_long
+
+        filtered_metrics_long = {}
+        for threshold in [0, 0.0005, 0.001, 0.0015, 0.002]:
+            mask = val_df_copy["pred_er_long"] > threshold
+            filtered_rets = val_df_copy.loc[mask, ret_col_long].fillna(0.0)
+            if len(filtered_rets) > 0:
+                m = _trade_metrics(filtered_rets)
+                filtered_metrics_long[f"er>{threshold}"] = m
+        metrics["filtered_long"] = filtered_metrics_long
+        metrics["filtered"] = filtered_metrics_long  # Backward compatibility
+
+    # Filtered metrics using model predictions - SHORT
+    if "er_short" in models and "er_short" in cfg.targets and "ret_net_short" in val_df.columns:
+        er_preds_short = models["er_short"].predict(X_val)
+        val_df_copy = val_df.copy()
+        val_df_copy["pred_er_short"] = er_preds_short
+
+        filtered_metrics_short = {}
+        for threshold in [0, 0.0005, 0.001, 0.0015, 0.002]:
+            mask = val_df_copy["pred_er_short"] > threshold
+            filtered_rets = val_df_copy.loc[mask, "ret_net_short"].fillna(0.0)
+            if len(filtered_rets) > 0:
+                m = _trade_metrics(filtered_rets)
+                filtered_metrics_short[f"er>{threshold}"] = m
+        metrics["filtered_short"] = filtered_metrics_short
 
     # Symbol-wise metrics
     symbol_metrics: Dict[str, Any] = {}
     for symbol, group in val_df.groupby("symbol"):
         if group.empty:
             continue
-        symbol_metrics[str(symbol)] = _trade_metrics(group["ret_net"].fillna(0.0))
+        symbol_metrics[str(symbol)] = _trade_metrics(group[ret_col_long].fillna(0.0))
     metrics["by_symbol"] = symbol_metrics
 
     regime_metrics: Dict[str, Any] = {}
@@ -441,7 +613,7 @@ def run_training_job(cfg: TrainConfig, symbols: List[str] | None = None) -> Dict
     for regime, group in valid_regime_df.groupby("btc_regime"):
         if group.empty:
             continue
-        regime_metrics[str(int(regime))] = _trade_metrics(group["ret_net"].fillna(0.0))
+        regime_metrics[str(int(regime))] = _trade_metrics(group[ret_col_long].fillna(0.0))
 
     spec_meta = cfg.label_spec or {}
     cost_breakdown = {

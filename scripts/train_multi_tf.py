@@ -18,6 +18,7 @@ from typing import List
 
 import pandas as pd
 
+from packages.common.config import get_settings
 from packages.common.db import bulk_upsert, fetch_all, get_conn
 
 logging.basicConfig(
@@ -28,11 +29,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 대상 심볼
-TARGET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "DOTUSDT"]
-
 # 타임프레임
 TIMEFRAMES = ["1m", "15m", "1h"]
+BASE_TIMEFRAME = "15m"
+
+
+def get_target_symbols() -> List[str]:
+    """설정된 유니버스 심볼 목록"""
+    settings = get_settings()
+    return settings.universe_list()
 
 
 def step1_resample_candles(symbols: List[str]) -> None:
@@ -101,12 +106,12 @@ def step3_labeling(symbols: List[str]) -> None:
     for tf in TIMEFRAMES:
         print(f"\n  === {tf} 라벨링 ===")
         config = LabelingConfig(timeframe=tf)  # type: ignore
-        stats = run_labeling(config=config, symbols=symbols, force_full=True, timeframe=tf)  # type: ignore
+        stats = run_labeling(config=config, symbols=symbols, force_full=False, timeframe=tf)  # type: ignore
         print(f"  → {tf}: {stats.total_new_labels:,}개 라벨 생성")
 
 
 def step4_train_models(symbols: List[str]) -> dict:
-    """Step 4: 모델 학습 (멀티 타임프레임)"""
+    """Step 4: 모델 학습 (멀티 타임프레임, 15m 라벨 기준)"""
     from services.labeling.pipeline import LabelingConfig
     from services.training.train import TrainConfig, run_training_job
 
@@ -117,7 +122,7 @@ def step4_train_models(symbols: List[str]) -> dict:
     # 데이터 범위 확인
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT MIN(ts), MAX(ts) FROM candles_1m WHERE symbol = 'BTCUSDT'")
+            cur.execute("SELECT MIN(ts), MAX(ts) FROM candles_15m WHERE symbol = 'BTCUSDT'")
             row = cur.fetchone()
             min_ts, max_ts = row[0], row[1]
 
@@ -135,7 +140,7 @@ def step4_train_models(symbols: List[str]) -> dict:
     print(f"  Val: {val_start.date()} ~ {val_end.date()}")
 
     # Label spec hash 계산
-    label_config = LabelingConfig()
+    label_config = LabelingConfig(timeframe=BASE_TIMEFRAME)  # 15m 라벨 기준
     spec = label_config.spec()
     spec_hash = spec.hash()
 
@@ -153,6 +158,7 @@ def step4_train_models(symbols: List[str]) -> dict:
         val_end=val_end.isoformat(),
         targets=("er_long", "q05_long", "e_mae_long", "e_hold_long"),
         use_multi_tf=True,
+        timeframe=BASE_TIMEFRAME,
     )
 
     result = run_training_job(train_cfg, symbols=symbols)
@@ -293,8 +299,8 @@ def main() -> None:
     parser.add_argument(
         "--symbols",
         nargs="+",
-        default=TARGET_SYMBOLS,
-        help=f"학습할 심볼 (기본값: {TARGET_SYMBOLS})",
+        default=None,
+        help="학습할 심볼 (기본값: 설정된 유니버스)",
     )
     parser.add_argument(
         "--skip-resample",
@@ -313,13 +319,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    symbols = args.symbols
+    symbols = args.symbols or get_target_symbols()
 
     print("=" * 60)
     print("멀티 타임프레임 학습 파이프라인")
     print("=" * 60)
     print(f"심볼: {', '.join(symbols)}")
-    print(f"타임프레임: {', '.join(TIMEFRAMES)}")
+    print(f"타임프레임: {', '.join(TIMEFRAMES)} (라벨 기준: {BASE_TIMEFRAME})")
 
     # Step 1: 리샘플링
     if not args.skip_resample:
