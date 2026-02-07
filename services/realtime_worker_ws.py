@@ -415,6 +415,7 @@ def _compute_and_store_features_15m(symbol: str) -> None:
 
         premium = _load_premium(symbol)
         btc_candles = _load_candles_15m("BTCUSDT") if symbol != "BTCUSDT" else candles
+        eth_candles = _load_candles_15m("ETHUSDT") if symbol not in ("BTCUSDT", "ETHUSDT") else None
         open_interest_df = _load_open_interest(symbol)
         long_short_ratio_df = _load_long_short_ratio(symbol)
 
@@ -423,6 +424,7 @@ def _compute_and_store_features_15m(symbol: str) -> None:
             candles,
             premium,
             btc_candles,
+            eth_candles=eth_candles,
             open_interest=open_interest_df,
             long_short_ratio=long_short_ratio_df,
             timeframe="15m",
@@ -467,6 +469,7 @@ def _compute_and_store_features_1h(symbol: str) -> None:
 
         premium = _load_premium(symbol)
         btc_candles = _load_candles_1h("BTCUSDT") if symbol != "BTCUSDT" else candles
+        eth_candles = _load_candles_1h("ETHUSDT") if symbol not in ("BTCUSDT", "ETHUSDT") else None
         open_interest_df = _load_open_interest(symbol)
         long_short_ratio_df = _load_long_short_ratio(symbol)
 
@@ -475,6 +478,7 @@ def _compute_and_store_features_1h(symbol: str) -> None:
             candles,
             premium,
             btc_candles,
+            eth_candles=eth_candles,
             open_interest=open_interest_df,
             long_short_ratio=long_short_ratio_df,
             timeframe="1h",
@@ -598,6 +602,7 @@ class RealtimeWorker:
 
             premium = _load_premium(symbol)
             btc_candles = _load_candles("BTCUSDT") if symbol != "BTCUSDT" else candles
+            eth_candles = _load_candles("ETHUSDT") if symbol not in ("BTCUSDT", "ETHUSDT") else None
             open_interest_df = _load_open_interest(symbol)
             long_short_ratio_df = _load_long_short_ratio(symbol)
 
@@ -606,6 +611,7 @@ class RealtimeWorker:
                 candles,
                 premium,
                 btc_candles,
+                eth_candles=eth_candles,
                 open_interest=open_interest_df,
                 long_short_ratio=long_short_ratio_df,
             )
@@ -674,9 +680,19 @@ class RealtimeWorker:
                 atr_1m = float(latest["atr"]) if pd.notna(latest.get("atr")) else 0.0
                 atr_15m = atr_1m * 10  # Approximate 15m ATR
 
+            # Get consecutive losses for filter and current equity for compound sizing
+            consecutive_losses = session_manager.get_consecutive_losses()
+            current_equity = session_manager.get_current_equity()
+
+            # Build filter features dict (use 1m features for btc_ret_60, atr_percentile)
+            filter_features = {
+                "btc_ret_60": features_clean.get("btc_ret_60", 0.0),
+                "atr_percentile": features_clean.get("atr_percentile", 50.0),
+            }
+
             # Preliminary decision to determine direction
-            state = {"equity": 10000.0, "sl_price": 0, "tp_price": 0}
-            decision = decide(symbol, preds, state, policy_cfg)
+            state = {"equity": current_equity, "sl_price": 0, "tp_price": 0}
+            decision = decide(symbol, preds, state, policy_cfg, filter_features, consecutive_losses, current_equity)
 
             # Calculate SL/TP based on direction (k_sl=1.0, k_tp=1.5 matching training labels)
             # Using 15m ATR for wider stops that match training labels
@@ -756,6 +772,7 @@ class RealtimeWorker:
                 decision=decision,
                 signal_row=signal_row,
                 last_close=last_close,
+                atr_15m=atr_15m,
             )
 
         except Exception as e:
@@ -767,6 +784,7 @@ class RealtimeWorker:
         decision: Dict[str, Any],
         signal_row: Dict[str, Any],
         last_close: float,
+        atr_15m: float = 0.0,
     ) -> None:
         """
         Execute shadow trade if conditions are met.
@@ -823,6 +841,15 @@ class RealtimeWorker:
                 )
                 return
 
+            # Check directional position limit (max 4 per direction)
+            max_directional = self.settings.max_directional_positions
+            directional_count = position_manager.count_directional_positions_in_db(trade_decision)
+            if directional_count >= max_directional:
+                logger.info(
+                    f"[SHADOW] Max {trade_decision} positions reached ({directional_count}/{max_directional}), skipping {symbol}"
+                )
+                return
+
             # Determine fill price
             fill_price = last_close
             if self.book_ticker_handler:
@@ -838,9 +865,21 @@ class RealtimeWorker:
             size_notional = decision.get("size_notional", 100.0)  # Default $100
             qty = size_notional / fill_price if fill_price > 0 else 0
 
-            # Get SL/TP from signal
-            sl_price = signal_row.get("sl_price")
-            tp_price = signal_row.get("tp_price")
+            # Recalculate SL/TP based on actual fill_price (not candle close)
+            # This ensures correct SL/TP distance when price moves between signal and execution
+            k_sl = 1.0
+            k_tp = 1.5
+            if atr_15m > 0:
+                if trade_decision == "LONG":
+                    sl_price = fill_price - atr_15m * k_sl
+                    tp_price = fill_price + atr_15m * k_tp
+                else:  # SHORT
+                    sl_price = fill_price + atr_15m * k_sl
+                    tp_price = fill_price - atr_15m * k_tp
+            else:
+                # Fallback to signal's SL/TP if ATR not available
+                sl_price = signal_row.get("sl_price")
+                tp_price = signal_row.get("tp_price")
             trade_group_id = signal_row.get("trade_group_id")
 
             # Register position with position_manager

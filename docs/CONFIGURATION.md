@@ -51,28 +51,70 @@ FILUSDT,AXSUSDT,ENAUSDT,ZKUSDT,ZECUSDT,TRUMPUSDT,NEARUSDT
 | `MAX_USED_MARGIN_PCT` | `0.35` | 최대 마진 사용률 35% |
 | `DAILY_LOSS_LIMIT_PCT` | `0.02` | 일일 손실 한도 2% |
 | `MAX_POSITIONS` | `6` | 최대 동시 포지션 |
+| `MAX_DIRECTIONAL_POSITIONS` | `4` | 같은 방향 최대 포지션 (신규) |
 | `MAX_TOTAL_NOTIONAL_PCT` | `1.2` | 최대 총 명목가치 |
 | `MAX_DIRECTIONAL_NOTIONAL_PCT` | `0.8` | 최대 방향성 명목가치 |
 
 ### Policy (진입 필터)
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `EV_MIN` | `0.002` | 최소 Expected Return (0.2%) |
+| `EV_MIN` | `0.001` | 최소 Expected Return (0.1%) |
 | `Q05_MIN` | `-0.02` | 최소 5th percentile (-2%) |
 | `MAE_MAX` | `0.05` | 최대 MAE (5%) |
 
-### Trading
+### Trading (복리 시스템)
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `INITIAL_CAPITAL` | `300.0` | 초기 자본 $300 |
-| `POSITION_SIZE` | `30.0` | 포지션당 마진 $30 |
-| `LEVERAGE` | `10` | 레버리지 10배 |
+| `POSITION_SIZE` | `30.0` | (미사용, 복리로 대체) |
+| `LEVERAGE` | `20` | 레버리지 20배 |
+
+**복리 계산**: 포지션 사이즈 = 현재 자본 × 10% × 레버리지(20)
 
 ### Simulation
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `TAKER_FEE_RATE` | `0.0004` | Taker 수수료 0.04% |
 | `SLIPPAGE_K` | `0.15` | 슬리피지 계수 |
+
+---
+
+## Signal Filters (services/policy/decide.py)
+
+### 기본 필터 (EV/Q05/MAE)
+| 필터 | 조건 | 설명 |
+|------|------|------|
+| EV_MIN | EV < 0.001 | 최소 기대수익 0.1% 미만 시 차단 |
+| Q05_MIN | q05 < -0.02 | 5% 손실 확률 > 2% 시 차단 |
+| MAE_MAX | e_mae > 0.05 | 최대 손실 예상 > 5% 시 차단 |
+
+### 시장 상황 필터 (신규)
+
+#### 1. Market Direction Filter (극단적 시장 방향 차단)
+| 조건 | 액션 | 사유 코드 |
+|------|------|----------|
+| btc_ret_60 > 1.5% & decision=SHORT | 차단 | EXTREME_PUMP |
+| btc_ret_60 < -1.5% & decision=LONG | 차단 | EXTREME_DUMP |
+
+#### 2. Volatility Filter (고변동성 필터)
+| 조건 | 액션 | 사유 코드 |
+|------|------|----------|
+| atr_percentile > 90% & EV < 0.2% | 차단 | HIGH_VOL_LOW_EV |
+
+#### 3. Consecutive Loss Filter (연속 손실 필터)
+| 조건 | 액션 | 사유 코드 |
+|------|------|----------|
+| 연속 손실 >= 3회 & EV < 0.3% | 차단 | RECOVERY_MODE |
+
+### 필터 상수 (decide.py)
+```python
+EXTREME_PUMP_THRESHOLD = 0.015   # 1시간 1.5% 상승
+EXTREME_DUMP_THRESHOLD = -0.015  # 1시간 1.5% 하락
+HIGH_VOLATILITY_THRESHOLD = 90   # ATR 상위 10%
+HIGH_VOL_EV_MIN = 0.002          # 고변동성 EV 기준 0.2%
+MAX_CONSECUTIVE_LOSSES = 3       # 연패 임계값
+RECOVERY_EV_MIN = 0.003          # 연패 후 EV 기준 0.3%
+```
 
 ---
 
@@ -134,12 +176,12 @@ FILUSDT,AXSUSDT,ENAUSDT,ZKUSDT,ZECUSDT,TRUMPUSDT,NEARUSDT
 
 | 항목 | 값 |
 |------|-----|
-| Model ID | `c87b3140-ec29-444a-9b11-6823cd0a64c9` |
+| Model ID | `e0925468-bda8-4711-86d8-9b1866b7fc70` |
 | Algorithm | LightGBM |
-| Feature Schema | v4 |
-| Label Spec Hash | `8c8d570e2343c185` |
-| Train Period | 2025-02-02 ~ 2026-02-05 |
-| Symbols | 22개 |
+| Feature Schema | v5 (Multi-TF: 1m+15m+1h = 105 features) |
+| Label Spec Hash | `97ed8e99c6d9f2ea` |
+| Train Period | 2024-01-01 ~ 2026-01-30 |
+| Symbols | 21개 |
 | Production | Yes |
 
 ---

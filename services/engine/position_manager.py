@@ -332,6 +332,33 @@ class PositionManager:
             logger.error(f"Failed to count open positions in DB: {e}")
             return len(self._positions)
 
+    def count_directional_positions_in_db(self, side: str) -> int:
+        """
+        Count open positions by direction (LONG/SHORT) in the database.
+
+        Args:
+            side: "LONG" or "SHORT"
+
+        Returns:
+            Number of open positions in the specified direction.
+        """
+        try:
+            rows = fetch_all("""
+                SELECT COUNT(DISTINCT symbol)
+                FROM positions p
+                WHERE p.event_type = 'entry'
+                AND p.side = %s
+                AND NOT EXISTS (
+                    SELECT 1 FROM positions p2
+                    WHERE p2.trade_group_id = p.trade_group_id
+                    AND p2.event_type = 'FINAL'
+                )
+            """, (side,))
+            return rows[0][0] if rows else 0
+        except Exception as e:
+            logger.error(f"Failed to count {side} positions in DB: {e}")
+            return 0
+
     def get_all_positions(self) -> Dict[str, OpenPosition]:
         """Get all open positions from database.
 

@@ -44,10 +44,11 @@ class Settings(BaseSettings):
     max_used_margin_pct: float = 0.35
     daily_loss_limit_pct: float = 0.02
     max_positions: int = 6
+    max_directional_positions: int = 4  # 같은 방향 최대 포지션 수
     max_total_notional_pct: float = 1.2
     max_directional_notional_pct: float = 0.8
 
-    ev_min: float = 0.0015  # 0.15% minimum expected return (filters for higher quality trades)
+    ev_min: float = 0.001  # 0.1% minimum expected return (optimized for total profit)
     q05_min: float = -0.002  # Original threshold
     mae_max: float = 0.01   # Original threshold
 

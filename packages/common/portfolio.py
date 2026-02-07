@@ -18,7 +18,9 @@ def get_portfolio_metrics() -> Dict[str, float]:
             COUNT(*) FILTER (WHERE event_type = 'OPEN' AND amt > 0) AS open_positions,
             COALESCE(SUM(CASE WHEN event_type = 'OPEN' AND amt > 0 THEN notional ELSE 0 END), 0) AS total_notional,
             COALESCE(SUM(CASE WHEN event_type = 'OPEN' AND amt > 0 AND side = 'BUY' THEN notional ELSE 0 END), 0) AS long_notional,
-            COALESCE(SUM(CASE WHEN event_type = 'OPEN' AND amt > 0 AND side = 'SELL' THEN notional ELSE 0 END), 0) AS short_notional
+            COALESCE(SUM(CASE WHEN event_type = 'OPEN' AND amt > 0 AND side = 'SELL' THEN notional ELSE 0 END), 0) AS short_notional,
+            COUNT(*) FILTER (WHERE event_type = 'OPEN' AND amt > 0 AND side = 'BUY') AS long_count,
+            COUNT(*) FILTER (WHERE event_type = 'OPEN' AND amt > 0 AND side = 'SELL') AS short_count
         FROM positions
         """
     )
@@ -26,6 +28,8 @@ def get_portfolio_metrics() -> Dict[str, float]:
     total = float(rows[0][1] or 0.0)
     long = float(rows[0][2] or 0.0)
     short = float(rows[0][3] or 0.0)
+    long_count = int(rows[0][4] or 0) if rows else 0
+    short_count = int(rows[0][5] or 0) if rows else 0
 
     today = _today_midnight()
     pnl_rows = fetch_all(
@@ -46,6 +50,8 @@ def get_portfolio_metrics() -> Dict[str, float]:
         "total_notional": total,
         "long_notional": long,
         "short_notional": short,
+        "long_count": long_count,
+        "short_count": short_count,
         "daily_pnl": realized,
         "daily_loss": negative,
     }

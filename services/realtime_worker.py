@@ -35,6 +35,7 @@ from services.simulator.fill import FillModel, simulate_trade_path
 from services.simulator.trade_writer import TradeGroupWriter
 from services.userstream.stream_manager import UserStreamManager
 from services.monitoring.drift import compute_missing_rate
+from services.engine.session_manager import session_manager
 
 
 def _load_candles(symbol: str, limit: int = 500) -> pd.DataFrame:
@@ -168,6 +169,7 @@ def main() -> None:
         settings.max_used_margin_pct,
         settings.daily_loss_limit_pct,
         settings.max_positions,
+        settings.max_directional_positions,
         settings.max_total_notional_pct,
         settings.max_directional_notional_pct,
         settings.drift_missing_alert_rate,
@@ -314,7 +316,19 @@ def main() -> None:
                 sl_price = last_close - atr * 1.0
                 tp_price = last_close + atr * 1.5
                 state = {"equity": 10000.0, "sl_price": sl_price, "tp_price": tp_price}
-                decision = decide(symbol, preds, state, policy_cfg)
+
+                # Get consecutive losses for filter and current equity for compound sizing
+                consecutive_losses = session_manager.get_consecutive_losses()
+                current_equity = session_manager.get_current_equity()
+
+                # Build filter features dict
+                filter_features = {
+                    "btc_ret_60": features_clean.get("btc_ret_60", 0.0),
+                    "atr_percentile": features_clean.get("atr_percentile", 50.0),
+                }
+
+                state["equity"] = current_equity
+                decision = decide(symbol, preds, state, policy_cfg, filter_features, consecutive_losses, current_equity)
                 data_stale = False
                 if isinstance(latest["ts"], pd.Timestamp):
                     lag_sec = (datetime.now(timezone.utc) - latest["ts"]).total_seconds()

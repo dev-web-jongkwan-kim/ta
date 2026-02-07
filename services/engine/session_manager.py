@@ -384,6 +384,9 @@ class TradingSessionManager:
             stats["mode"] = mode
             stats["running_time_sec"] = int((datetime.now(timezone.utc) - started_at).total_seconds())
 
+        # Add current equity for compound interest display
+        stats["current_equity"] = self.get_current_equity()
+
         return stats
 
     def get_trades(
@@ -596,6 +599,72 @@ class TradingSessionManager:
         # - Model loaded
         # - WebSocket connected
         pass
+
+    def get_consecutive_losses(self) -> int:
+        """Get current consecutive loss count from recent trades."""
+        if not self._current_session:
+            return 0
+
+        try:
+            rows = fetch_all(
+                """
+                SELECT pnl FROM trades
+                WHERE session_id = %s AND exit_time IS NOT NULL
+                ORDER BY exit_time DESC
+                LIMIT 20
+                """,
+                (str(self._current_session.session_id),)
+            )
+
+            if not rows:
+                return 0
+
+            count = 0
+            for row in rows:
+                pnl = row[0]
+                if pnl is not None and float(pnl) < 0:
+                    count += 1
+                else:
+                    break
+            return count
+        except Exception as e:
+            logger.warning(f"Failed to get consecutive losses: {e}")
+            return 0
+
+    def get_current_equity(self) -> float:
+        """Get current equity (initial capital + total PnL) for compound interest."""
+        from packages.common.config import get_settings
+        settings = get_settings()
+        initial_capital = settings.initial_capital
+
+        if not self._current_session:
+            return initial_capital
+
+        try:
+            # Get session's initial capital if set
+            session_initial = self._current_session.initial_capital
+            if session_initial:
+                initial_capital = float(session_initial)
+
+            # Get total realized PnL from closed trades
+            rows = fetch_all(
+                """
+                SELECT COALESCE(SUM(pnl), 0) as total_pnl
+                FROM trades
+                WHERE session_id = %s AND exit_time IS NOT NULL
+                """,
+                (str(self._current_session.session_id),)
+            )
+
+            total_pnl = float(rows[0][0]) if rows and rows[0][0] else 0.0
+            current_equity = initial_capital + total_pnl
+
+            # Never go below minimum (10% of initial)
+            min_equity = initial_capital * 0.1
+            return max(current_equity, min_equity)
+        except Exception as e:
+            logger.warning(f"Failed to get current equity: {e}")
+            return initial_capital
 
 
 # Singleton instance

@@ -11,6 +11,7 @@ class RiskConfig:
     max_used_margin_pct: float
     daily_loss_limit_pct: float
     max_positions: int
+    max_directional_positions: int  # 같은 방향 최대 포지션 수
     max_total_notional_pct: float
     max_directional_notional_pct: float
     missing_alert_rate: float
@@ -31,6 +32,13 @@ def check_risk(action: Dict[str, Any], portfolio: Dict[str, Any], account: Dict[
 
     if metrics["open_positions"] >= cfg.max_positions:
         reasons.append("MAX_POSITIONS")
+
+    # 같은 방향 포지션 제한 (기본 4개)
+    decision_side = action.get("decision", "FLAT")
+    if decision_side == "LONG" and metrics.get("long_count", 0) >= cfg.max_directional_positions:
+        reasons.append("MAX_LONG_POSITIONS")
+    if decision_side == "SHORT" and metrics.get("short_count", 0) >= cfg.max_directional_positions:
+        reasons.append("MAX_SHORT_POSITIONS")
 
     total_notional = metrics["total_notional"]
     if equity and total_notional > cfg.max_total_notional_pct * equity:
